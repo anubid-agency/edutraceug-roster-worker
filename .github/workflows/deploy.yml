@@ -2,38 +2,36 @@ name: Deploy Worker
 on:
   push:
     branches: [main]
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
+      
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # This ensures package.json exists and xlsx is installed.
-      # We use "npm install" instead of "npm ci" to avoid the lockfile error 
-      # you saw in your screenshot if package-lock.json is missing.
+      # Installs xlsx and other dependencies, generating a lockfile if missing.
       - name: Install dependencies
-        run: |
-          if [ ! -f package.json ]; then
-            npm init -y
-            npm install xlsx
-          fi
-          npm install
+        run: npm install
 
-      - name: Apply D1 migrations (Schema)
+      - name: Apply D1 Schema
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.162.0" 
           command: d1 execute edutraceug-db --file=./schema.sql --remote
+        env:
+          CI: "true" # Prevents interactive prompts from hanging the action
 
       - name: Publish Worker
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.162.0"
