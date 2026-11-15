@@ -3,29 +3,10 @@
  * Single-file build.
  *
  * ------------------------------------------------------------------
- * ONE-TIME D1 MIGRATION (run once, adjust the table/column names if
- * your D1 schema differs — the worker reads/writes these names):
- *
- *   -- Recompute name_key for ALL existing roster rows.
- *   -- name_key = lowercase(first_name + ' ' + last_name) with
- *   -- repeated whitespace collapsed and the two parts re-sorted
- *   -- alphabetically as a single word-set (order-independent).
- *   --
- *   -- Because SQLite cannot easily split/sort words in pure SQL, the
- *   -- reliable way is a small Node script that reuses the exported
- *   -- nameKey() from this worker. If you must do it in D1 Console,
- *   -- run the UPDATE below for single-token names, then run the
- *   -- multi-token normalisation from the Node script.
- *
- *   UPDATE roster
- *   SET name_key = lower(trim(first_name) || ' ' || trim(last_name))
- *   WHERE first_name IS NOT NULL AND last_name IS NOT NULL
- *     AND instr(trim(first_name), ' ') = 0
- *     AND instr(trim(last_name), ' ') = 0;
- *
- *   -- Then, using this worker's exported nameKey(), run:
- *   --   for each row: name_key = nameKey(first_name, last_name)
- *   -- which sorts ALL words across BOTH names alphabetically.
+ * BEFORE ANY NEW UPLOAD: run POST /roster/rebuild-keys once per school.
+ * It recomputes name_key for every existing roster row using the
+ * order-independent word-sorted key (all words across first and last
+ * name, lowercased, alphabetically sorted, space-joined).
  * ------------------------------------------------------------------
  *
  * Accepts a school's student or teacher roster (xlsx/xls/xlsm/xltx/xltm/csv),
@@ -35,14 +16,16 @@
  *
  * Also serves the roster viewer/editor endpoints:
  *   POST /roster/list | /roster/classes | /roster/update | /roster/add | /roster/delete
+ *   POST /roster/rebuild-keys
  *
  * Firebase ID tokens are verified with crypto.subtle against Google's JWKS.
  * No service accounts, no OAuth, no Firestore.
  *
- * NEW ENV VARS (add in Cloudflare dashboard / wrangler):
+ * ENV VARS:
  *   GROQ_API_KEY        — Groq API key for the clarifying step.
  *   STATE_SIGNING_KEY   — long random string (32+ bytes) used to HMAC-sign
- *                         the 15-minute import state token.
+ *                         the needs_answers state token and the
+ *                         mappingState token (2h TTL).
  * ================================================================== */
 
 import * as XLSX from 'xlsx';
@@ -85,16 +68,36 @@ const LIST_DEFAULT_LIMIT = 100;
 const LIST_MAX_LIMIT = 200;
 const ADD_MAX_ROWS = 100;
 
-const SENTINEL = '\uffff';
-
 // Groq clarifying step
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 const GROQ_TIMEOUT_MS = 8_000;
 const GROQ_MAX_SAMPLE_ROWS = 8;
 
-// Signed state token TTL (15 minutes)
-const STATE_TTL_MS = 15 * 60 * 1000;
+// Signed state token TTLs
+const STATE_TTL_MS = 15 * 60 * 1000;      // needs_answers state
+const MAPPING_STATE_TTL_MS = 2 * 60 * 60 * 1000; // mappingState between chunks
+
+// name_key rebuild
+const REBUILD_BATCH_SIZE = 100;
+
+// Question ids the server knows how to apply
+const KNOWN_QUESTION_IDS = new Set([
+  'class',
+  'stream',
+  'header_row',
+  'name_order',
+  'name_column',
+  'subject_separator',
+  'gender_values',
+]);
+
+const SUBJECT_SEPARATORS = {
+  comma: ',',
+  semicolon: ';',
+  slash: '/',
+  newline: '\n',
+};
 
 // ==================================================================
 // Module-level caches
@@ -401,15 +404,13 @@ async function uploadRawToCloudinary(env, file, { folder }) {
 }
 
 async function uploadBufferToCloudinary(env, buffer, filename, { folder }) {
-  const blob = new Blob([buffer], {
-    type: 'text/csv',
-  });
+  const blob = new Blob([buffer], { type: 'text/csv' });
   const file = new File([blob], filename, { type: 'text/csv' });
   return uploadRawToCloudinary(env, file, { folder });
 }
 
 // ==================================================================
-// Name handling (PART A)
+// Name handling
 // ==================================================================
 
 // Order-independent name key: lowercase all words, sort alphabetically,
@@ -433,18 +434,14 @@ function collapseSpaces(s) {
 }
 
 function stripStrayCommas(s) {
-  // Remove commas that aren't part of a "Surname, First" pattern handled
-  // in splitFullName. Here we keep at most one comma (the surname one).
   const cleaned = String(s ?? '').replace(/,+/g, ',');
   const parts = cleaned.split(',');
   if (parts.length <= 2) return cleaned;
-  // More than one comma: keep the first as the surname separator, drop the rest.
   return parts[0] + ',' + parts.slice(1).join('');
 }
 
 function toNormalCapitalization(word) {
   if (!word) return '';
-  // Preserve apostrophe and hyphen segments.
   return word
     .split(/([ '-])/)
     .map((seg) => {
@@ -458,13 +455,10 @@ function toNormalCapitalization(word) {
 
 function cleanNamePart(raw) {
   let s = String(raw ?? '');
-  // Remove control chars
   s = s.replace(/[\u0000-\u001f\u007f]+/g, ' ');
   s = s.replace(/,+/g, ',');
   s = collapseSpaces(s);
-  // Drop leading/trailing commas and separators
   s = s.replace(/^[,\s]+|[,\s]+$/g, '');
-  // Normalise capitals if the whole string is ALL CAPS.
   if (s && s === s.toUpperCase() && /[A-Z]/.test(s)) {
     s = s
       .split(' ')
@@ -475,14 +469,6 @@ function cleanNamePart(raw) {
 }
 
 // Split a single full-name string into first/last.
-// Returns { firstName, lastName, error }.
-//
-// Rules:
-//  - comma: "Nakato, Mary" -> lastName "Nakato", firstName "Mary" (surname first)
-//  - no comma, 2+ words: first word = firstName, rest = lastName
-//  - one word: error "second name missing"
-//  - nameOrder "last_first": invert the no-comma result.
-//
 // Exported so other workers can reuse it.
 export function splitFullName(fullNameRaw, nameOrder = 'first_last') {
   let s = cleanNamePart(fullNameRaw);
@@ -503,11 +489,9 @@ export function splitFullName(fullNameRaw, nameOrder = 'first_last') {
       return { firstName: '', lastName: '', error: 'second name missing' };
     }
     if (!surname) {
-      // Comma but nothing before: treat as if there were no comma.
       return splitFullName(rest, nameOrder);
     }
     if (!rest) {
-      // Comma but nothing after: user typed "Nakato," — surname only.
       return { firstName: '', lastName: surname, error: 'second name missing' };
     }
     lastName = surname;
@@ -521,7 +505,6 @@ export function splitFullName(fullNameRaw, nameOrder = 'first_last') {
     lastName = words.slice(1).join(' ');
   }
 
-  // Normal-capitalize output words.
   firstName = firstName
     .split(' ')
     .map(toNormalCapitalization)
@@ -538,7 +521,6 @@ export function splitFullName(fullNameRaw, nameOrder = 'first_last') {
   }
 
   if (nameOrder === 'last_first') {
-    // Swap: first word becomes last name, rest becomes first name.
     return { firstName: lastName, lastName: firstName, error: null };
   }
 
@@ -630,7 +612,6 @@ function detectColumns(matrix, fileClass) {
       }
     }
 
-    // Core requirement: either (firstName + lastName) or fullName, plus a class.
     const hasSeparate = map.firstName !== undefined && map.lastName !== undefined;
     const hasSingle = map.fullName !== undefined;
     const hasClass = map.class !== undefined || !!fileClass;
@@ -676,7 +657,15 @@ function parseWorkbook(buffer) {
   return { sheetName, matrix };
 }
 
-function extractRowsFromMatrix(matrix, columns, fileClass, fileStream, nameOrder) {
+function extractRowsFromMatrix(
+  matrix,
+  columns,
+  fileClass,
+  fileStream,
+  nameOrder,
+  subjectSeparator = ',',
+  genderMap = null
+) {
   const startIndex = columns.headerRowIndex + 1;
   const rows = [];
 
@@ -685,7 +674,6 @@ function extractRowsFromMatrix(matrix, columns, fileClass, fileStream, nameOrder
     const isBlank = !raw.some((v) => String(v ?? '').trim() !== '');
     if (isBlank) continue;
 
-    // Resolve name: prefer explicit first/last; fall back to single column.
     let firstName = cellAt(raw, columns.map.firstName);
     let lastName = cellAt(raw, columns.map.lastName);
     const singleName = cellAt(raw, columns.map.fullName);
@@ -701,6 +689,15 @@ function extractRowsFromMatrix(matrix, columns, fileClass, fileStream, nameOrder
       }
     }
 
+    const rawGender = cellAt(raw, columns.map.gender);
+    let gender = rawGender;
+    if (genderMap && rawGender) {
+      const mapped = genderMap[rawGender] || genderMap[rawGender.toLowerCase()];
+      if (mapped === 'Male' || mapped === 'Female') gender = mapped;
+    }
+
+    const subjectCell = cellAt(raw, columns.map.subject);
+
     rows.push({
       excelRow: i + 1,
       nameError,
@@ -708,42 +705,27 @@ function extractRowsFromMatrix(matrix, columns, fileClass, fileStream, nameOrder
       firstName,
       lastName,
       class: cellAt(raw, columns.map.class) || fileClass || '',
-      gender: cellAt(raw, columns.map.gender),
+      gender,
       stream: cellAt(raw, columns.map.stream) || fileStream || '',
-      subject: cellAt(raw, columns.map.subject),
+      subject: subjectCell,
       extraDetail: cellAt(raw, columns.map.extraDetail),
+      subjectSeparator,
+      genderMap,
     });
   }
 
   return rows;
 }
 
-function readRosterRows(buffer, fileClass, fileStream, nameOrder) {
-  const { sheetName, matrix } = parseWorkbook(buffer);
-
-  if (matrix.length === 0) {
-    throw new UploadValidationError('The sheet is empty.');
-  }
-
-  const columns = detectColumns(matrix, fileClass);
-  const rows = extractRowsFromMatrix(matrix, columns, fileClass, fileStream, nameOrder);
-
-  if (rows.length === 0) {
-    throw new UploadValidationError(
-      'No data rows found. The file must contain a header row (first name, last name, class, ...) followed by data rows.'
-    );
-  }
-
-  return { sheetName, columns, rows };
-}
-
 // ==================================================================
 // Merge / validation helpers
 // ==================================================================
 
-function splitList(v) {
+function splitList(v, separator = ',') {
+  const sep = SUBJECT_SEPARATORS[separator] || separator;
+  if (!sep) return [];
   return String(v || '')
-    .split(/[,;]+/)
+    .split(sep)
     .map((s) => s.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 }
@@ -765,14 +747,14 @@ function normalizeGender(raw) {
   return '';
 }
 
-function validateAndNormalize(row, fileClass, fileStream, recordType) {
+function validateAndNormalize(row, fileClass, fileStream, recordType, subjectSeparator, genderMap) {
   const errors = [];
 
   const firstName = row.firstName;
   const lastName = row.lastName;
   const className = row.class || fileClass || '';
   const stream = row.stream || fileStream || '';
-  const subjects = splitList(row.subject);
+  const subjects = splitList(row.subject, subjectSeparator);
   const extraDetail = row.extraDetail;
   const studentId = row.studentId || '';
 
@@ -781,7 +763,11 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
   let gender = '';
   const rawGender = String(row.gender || '').trim();
   if (rawGender) {
-    gender = normalizeGender(rawGender);
+    if (genderMap && (genderMap[rawGender] || genderMap[rawGender.toLowerCase()])) {
+      gender = genderMap[rawGender] || genderMap[rawGender.toLowerCase()];
+    } else {
+      gender = normalizeGender(rawGender);
+    }
     if (!gender) errors.push('gender must be Male or Female');
   }
 
@@ -833,7 +819,7 @@ function desiredKey(recordType, d) {
 }
 
 // ==================================================================
-// Signed state token (PART B)
+// Signed state token (needs_answers + mappingState)
 // ==================================================================
 
 async function hmacSign(key, message) {
@@ -848,13 +834,13 @@ async function hmacSign(key, message) {
   return bytesToB64url(new Uint8Array(sig));
 }
 
-async function createStateToken(env, payload) {
+async function createSignedToken(env, payload, ttlMs) {
   if (!env.STATE_SIGNING_KEY) {
     throw new HttpError(500, 'STATE_SIGNING_KEY is not configured.');
   }
   const body = {
     ...payload,
-    exp: Date.now() + STATE_TTL_MS,
+    exp: Date.now() + ttlMs,
     nonce: randomHex(8),
   };
   const bodyB64 = b64urlEncodeString(JSON.stringify(body));
@@ -862,7 +848,7 @@ async function createStateToken(env, payload) {
   return `${bodyB64}.${sig}`;
 }
 
-async function verifyStateToken(env, token) {
+async function verifySignedToken(env, token) {
   if (!env.STATE_SIGNING_KEY) {
     throw new HttpError(500, 'STATE_SIGNING_KEY is not configured.');
   }
@@ -884,7 +870,7 @@ async function verifyStateToken(env, token) {
 }
 
 // ==================================================================
-// Groq clarifying step (PART B)
+// Groq clarifying step
 // ==================================================================
 
 const KNOWN_GROQ_FIELDS = new Set([
@@ -924,21 +910,46 @@ function sanitizeGroqNameOrder(raw) {
   return null;
 }
 
+// Groq may ONLY return question ids from KNOWN_QUESTION_IDS, with optional
+// option lists. The server builds the question text.
 function sanitizeGroqQuestions(raw) {
   if (!Array.isArray(raw)) return [];
   const out = [];
+  const seen = new Set();
   for (const q of raw) {
     if (!q || typeof q !== 'object') continue;
     const id = strOrEmpty(q.id);
-    const text = strOrEmpty(q.text);
-    if (!id || !text) continue;
+    if (!KNOWN_QUESTION_IDS.has(id)) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
     const options = Array.isArray(q.options)
       ? q.options.map((o) => strOrEmpty(o)).filter(Boolean).slice(0, 12)
       : [];
-    out.push({ id, text, options });
-    if (out.length >= 8) break;
+    out.push({ id, options });
+    if (out.length >= KNOWN_QUESTION_IDS.size) break;
   }
   return out;
+}
+
+function buildQuestionText(id) {
+  switch (id) {
+    case 'class':
+      return 'Which class should be used for rows where the class column is blank?';
+    case 'stream':
+      return 'Which stream should be used for rows where the stream column is blank?';
+    case 'header_row':
+      return 'Which row is the header row? (Send headerRowIndex; use -1 to indicate "no header".)';
+    case 'name_order':
+      return 'Is the first word the first name or the surname? (nameOrder: "first_last" or "last_first")';
+    case 'name_column':
+      return 'Which columns map to which fields? (Send columnMap with field names as keys and 0-based integer indexes.)';
+    case 'subject_separator':
+      return 'How are subjects separated in the subject column? (comma, semicolon, slash, newline)';
+    case 'gender_values':
+      return 'What do the gender values mean? (Send genderMap mapping the sheet value to "Male" or "Female".)';
+    default:
+      return '';
+  }
 }
 
 async function callGroqForClarification(env, sampleRows, recordType, current) {
@@ -953,10 +964,10 @@ async function callGroqForClarification(env, sampleRows, recordType, current) {
     'Respond with STRICT JSON only, no markdown, matching exactly this shape: ' +
     '{"columnMap": {"studentId":0,"firstName":1,"lastName":2,"fullName":null,"class":3,"gender":null,"stream":null,"subject":null,"extraDetail":null}, ' +
     '"headerRowIndex": 0, "nameOrder": "first_last" | "last_first", ' +
-    '"questions": [{"id":"...","text":"...","options":["..."]}]}. ' +
+    '"questions": [{"id": "class" | "stream" | "header_row" | "name_order" | "name_column" | "subject_separator" | "gender_values", "options": ["..."]}]}. ' +
     'columnMap values are 0-based column indices or null. ' +
     'Only use these field names: studentId, firstName, lastName, fullName, class, gender, stream, subject, extraDetail. ' +
-    'If a single name column is present, set fullName to its index and leave firstName/lastName null. ' +
+    'The questions array may ONLY contain ids from this list: class, stream, header_row, name_order, name_column, subject_separator, gender_values. ' +
     'If everything is clear, return an empty questions array.';
 
   const userPayload = {
@@ -1015,30 +1026,123 @@ async function callGroqForClarification(env, sampleRows, recordType, current) {
 }
 
 function needsGroqClarification(columns, fileClass, matrix, recordType) {
-  // No header found → positional fallback.
   if (columns.headerRowIndex === -1) return true;
 
-  // No class available (neither column nor form field).
   const hasClassCol = columns.map.class !== undefined;
   if (!hasClassCol && !fileClass) return true;
 
-  // Ambiguous name column: fullName and separate names both present, or
-  // no name mapping at all.
   const hasFull = columns.map.fullName !== undefined;
   const hasSeparate =
     columns.map.firstName !== undefined && columns.map.lastName !== undefined;
   if (!hasFull && !hasSeparate) return true;
   if (hasFull && hasSeparate) return true;
 
-  // Teacher upload missing subject column.
   if (recordType === 'teacher' && columns.map.subject === undefined) return true;
 
-  // Also ask when there is no header row but we guessed positionally —
-  // covered by headerRowIndex === -1 above.
   return false;
 }
 
-function buildCleanedCsv(rows, nameOrder) {
+// ==================================================================
+// Answer validation
+// ==================================================================
+
+function validateAnswers(rawAnswers) {
+  const out = {
+    class: null,
+    stream: null,
+    headerRowIndex: null,
+    nameOrder: null,
+    columnMap: null,
+    subjectSeparator: null,
+    genderMap: null,
+  };
+  if (!rawAnswers || typeof rawAnswers !== 'object') return out;
+
+  if (rawAnswers.class !== undefined) {
+    const v = strOrEmpty(rawAnswers.class);
+    if (!v) throw new HttpError(400, 'answers.class must be a non-empty string.');
+    if (v.length > 60) throw new HttpError(400, 'answers.class must be at most 60 characters.');
+    out.class = v;
+  }
+
+  if (rawAnswers.stream !== undefined) {
+    const v = strOrEmpty(rawAnswers.stream);
+    if (v.length > 60) throw new HttpError(400, 'answers.stream must be at most 60 characters.');
+    out.stream = v;
+  }
+
+  if (rawAnswers.headerRowIndex !== undefined) {
+    const n = Number(rawAnswers.headerRowIndex);
+    if (!Number.isInteger(n) || n < -1) {
+      throw new HttpError(400, 'answers.headerRowIndex must be an integer >= -1.');
+    }
+    out.headerRowIndex = n;
+  }
+
+  if (rawAnswers.nameOrder !== undefined) {
+    const v = strOrEmpty(rawAnswers.nameOrder);
+    if (v !== 'first_last' && v !== 'last_first') {
+      throw new HttpError(400, 'answers.nameOrder must be "first_last" or "last_first".');
+    }
+    out.nameOrder = v;
+  }
+
+  if (rawAnswers.columnMap !== undefined) {
+    const map = sanitizeGroqColumnMap(rawAnswers.columnMap);
+    if (!map) throw new HttpError(400, 'answers.columnMap must be an object.');
+    out.columnMap = map;
+  }
+
+  if (rawAnswers.subjectSeparator !== undefined) {
+    const v = strOrEmpty(rawAnswers.subjectSeparator).toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(SUBJECT_SEPARATORS, v)) {
+      throw new HttpError(
+        400,
+        'answers.subjectSeparator must be one of: comma, semicolon, slash, newline.'
+      );
+    }
+    out.subjectSeparator = v;
+  }
+
+  if (rawAnswers.genderMap !== undefined) {
+    const gm = rawAnswers.genderMap;
+    if (!gm || typeof gm !== 'object' || Array.isArray(gm)) {
+      throw new HttpError(400, 'answers.genderMap must be an object.');
+    }
+    const clean = {};
+    for (const [k, v] of Object.entries(gm)) {
+      const key = strOrEmpty(k);
+      if (!key) continue;
+      const val = strOrEmpty(v);
+      if (val !== 'Male' && val !== 'Female') {
+        throw new HttpError(
+          400,
+          `answers.genderMap["${key}"] must be "Male" or "Female".`
+        );
+      }
+      clean[key] = val;
+    }
+    out.genderMap = clean;
+  }
+
+  return out;
+}
+
+// ==================================================================
+// Cleaned CSV
+// ==================================================================
+
+function csvSafeCell(v) {
+  const s = String(v ?? '');
+  if (!s) return s;
+  const first = s.charAt(0);
+  if (first === '=' || first === '+' || first === '-' || first === '@' || first === '\t' || first === '\r') {
+    return "'" + s;
+  }
+  return s;
+}
+
+function buildCleanedCsv(rows) {
   const headers = [
     'studentId',
     'firstName',
@@ -1051,7 +1155,8 @@ function buildCleanedCsv(rows, nameOrder) {
   ];
 
   const escapeCsv = (v) => {
-    const s = String(v ?? '');
+    const raw = String(v ?? '');
+    const s = csvSafeCell(raw);
     if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
     return s;
   };
@@ -1194,30 +1299,8 @@ async function getTeacherScope(env, schoolId, user) {
   return { streamOnly, classOnly };
 }
 
-function applyTeacherScope(where, params, scope) {
-  if (!scope) return;
-  const parts = [];
-  if (scope.streamOnly.length > 0) {
-    parts.push(
-      `EXISTS (SELECT 1 FROM json_each(?) j
-               WHERE j.value->>'class' = roster.class_name
-                 AND j.value->>'stream' = roster.stream)`
-    );
-    params.push(JSON.stringify(scope.streamOnly));
-  }
-  if (scope.classOnly.length > 0) {
-    parts.push(`roster.class_name IN (SELECT value FROM json_each(?))`);
-    params.push(JSON.stringify(scope.classOnly));
-  }
-  if (parts.length === 0) {
-    where.push('0 = 1');
-    return;
-  }
-  where.push(`(${parts.join(' OR ')})`);
-}
-
 // ==================================================================
-// Import processing (shared by the normal path and the post-answers path)
+// Import processing
 // ==================================================================
 
 async function processRosterRows({
@@ -1231,7 +1314,8 @@ async function processRosterRows({
   batchId,
   cloudinaryUrl,
   uid,
-  nameOrder = 'first_last',
+  subjectSeparator = 'comma',
+  genderMap = null,
   cleanedFileUrl = null,
 }) {
   if (!RECORD_TYPES.has(recordType)) {
@@ -1253,7 +1337,14 @@ async function processRosterRows({
   /* ---- validate + group ---- */
   const groups = new Map();
   for (const row of slice) {
-    const { errors, value } = validateAndNormalize(row, fileClass, fileStream, recordType);
+    const { errors, value } = validateAndNormalize(
+      row,
+      fileClass,
+      fileStream,
+      recordType,
+      subjectSeparator,
+      genderMap
+    );
 
     if (errors.length > 0) {
       rejected.push({ row: row.excelRow, reason: errors.join('; ') });
@@ -1286,10 +1377,8 @@ async function processRosterRows({
     }
   }
 
-  // PART A7: within the same class and stream, two students with the same
-  // name_key are returned in "duplicates" instead of being silently merged.
   const dupBuckets = new Map();
-  for (const [key, g] of groups.entries()) {
+  for (const g of groups.values()) {
     if (g.excelRows.length > 1) {
       const d = g.desired;
       const bucketKey = [
@@ -1569,6 +1658,7 @@ async function handleUploadRoster(request, env) {
 
   const stateTokenRaw = strOrEmpty(form.get('state'));
   const answersRaw = strOrEmpty(form.get('answers'));
+  const mappingStateRaw = strOrEmpty(form.get('mappingState'));
 
   /* ---- 2. Validate ---- */
   if (!schoolId) throw new UploadValidationError('"schoolId" is required.');
@@ -1620,7 +1710,7 @@ async function handleUploadRoster(request, env) {
     }
   }
 
-  /* ---- 4. Virus scan — at offset 0 or when the file is about to be uploaded ---- */
+  /* ---- 4. Virus scan ---- */
   if (offset === 0 || !cloudinaryUrl) {
     const scan = await scanFileForViruses(env, file);
     if (!scan.clean) {
@@ -1644,238 +1734,76 @@ async function handleUploadRoster(request, env) {
   const { sheetName, matrix } = parseWorkbook(buffer);
   if (matrix.length === 0) throw new UploadValidationError('The sheet is empty.');
 
-  /* ---- 7. Resolve confirmed mapping from state/answers, if supplied ---- */
-  let confirmedMapping = null;
-  if (stateTokenRaw) {
-    const state = await verifyStateToken(env, stateTokenRaw);
-    if (state.schoolId !== schoolId || state.recordType !== recordType) {
-      throw new HttpError(400, 'State token does not match this upload.');
+  /* ---- 7. CHUNK CONTINUATION: offset > 0 uses ONLY mappingState ---- */
+  if (offset > 0) {
+    if (!mappingStateRaw) {
+      throw new HttpError(400, 'mappingState is required to continue this upload.');
     }
-    let answers = {};
-    if (answersRaw) {
-      try {
-        answers = JSON.parse(answersRaw);
-      } catch {
-        throw new HttpError(400, '"answers" must be valid JSON.');
-      }
-    }
-    const proposed = state.proposed || {};
-    const mapping = {
-      headerRowIndex: sanitizeGroqHeaderRowIndex(proposed.headerRowIndex),
-      map: sanitizeGroqColumnMap(proposed.columnMap) || {},
-      nameOrder: sanitizeGroqNameOrder(proposed.nameOrder) || nameOrder,
-    };
-    // Apply answers: the frontend may override headerRowIndex / nameOrder /
-    // columnMap by sending an answers object with those keys.
-    if (answers && typeof answers === 'object') {
-      if (answers.headerRowIndex !== undefined) {
-        const v = sanitizeGroqHeaderRowIndex(answers.headerRowIndex);
-        if (v !== null) mapping.headerRowIndex = v;
-      }
-      if (answers.nameOrder !== undefined) {
-        const v = sanitizeGroqNameOrder(answers.nameOrder);
-        if (v !== null) mapping.nameOrder = v;
-      }
-      if (answers.columnMap !== undefined) {
-        const v = sanitizeGroqColumnMap(answers.columnMap);
-        if (v) mapping.map = { ...mapping.map, ...v };
-      }
-    }
-    if (mapping.headerRowIndex === null) mapping.headerRowIndex = -1;
-    confirmedMapping = mapping;
-  }
-
-  /* ---- 8. Rule-based header detection ---- */
-  let columns;
-  if (confirmedMapping) {
-    columns = {
-      headerRowIndex: confirmedMapping.headerRowIndex,
-      map: confirmedMapping.map,
-      score: 0,
-      positional: confirmedMapping.headerRowIndex === -1,
-    };
-  } else {
-    columns = detectColumns(matrix, fileClass);
-  }
-
-  const effectiveNameOrder = confirmedMapping
-    ? confirmedMapping.nameOrder
-    : nameOrder;
-
-  /* ---- 9. Groq clarifying step (offset 0 only, and only if unclear) ---- */
-  if (
-    offset === 0 &&
-    !confirmedMapping &&
-    (recordType === 'student' || recordType === 'teacher') &&
-    needsGroqClarification(columns, fileClass, matrix, recordType)
-  ) {
-    const sampleRows = matrix
-      .slice(0, GROQ_MAX_SAMPLE_ROWS)
-      .map((r) => (Array.isArray(r) ? r.map((c) => String(c ?? '')) : []));
-
-    const groq = await callGroqForClarification(env, sampleRows, recordType, columns);
-
-    if (groq) {
-      // Merge Groq's proposal into the rule-based result.
-      const proposedHeaderRowIndex =
-        groq.headerRowIndex !== null ? groq.headerRowIndex : columns.headerRowIndex;
-      const proposedMap = { ...columns.map, ...(groq.columnMap || {}) };
-      const proposedNameOrder = groq.nameOrder || nameOrder;
-
-      const questions = groq.questions || [];
-      if (questions.length > 0) {
-        const state = await createStateToken(env, {
-          schoolId,
-          recordType,
-          fileClass,
-          fileStream,
-          nameOrder,
-          proposed: {
-            headerRowIndex: proposedHeaderRowIndex,
-            columnMap: proposedMap,
-            nameOrder: proposedNameOrder,
-          },
-        });
-
-        const sampleMatrix = matrix
-          .slice(0, GROQ_MAX_SAMPLE_ROWS)
-          .map((r) => (Array.isArray(r) ? r : []));
-
-        return jsonResponse({
-          status: 'needs_answers',
-          questions,
-          state,
-          sample: sampleMatrix,
-        });
-      }
-
-      // No questions: accept Groq's confirmed mapping.
-      columns = {
-        headerRowIndex: proposedHeaderRowIndex,
-        map: proposedMap,
-        score: 0,
-        positional: proposedHeaderRowIndex === -1,
-      };
-    }
-  }
-
-  /* ---- 10. Extract rows using the (possibly confirmed) mapping ---- */
-  const rows = extractRowsFromMatrix(
-    matrix,
-    columns,
-    fileClass,
-    fileStream,
-    confirmedMapping ? confirmedMapping.nameOrder : effectiveNameOrder
-  );
-
-  if (rows.length === 0) {
-    throw new UploadValidationError(
-      'No data rows found. The file must contain a header row (first name, last name, class, ...) followed by data rows.'
-    );
-  }
-
-  /* ---- 11. Build a cleaned copy and upload it (offset 0 only) ---- */
-  let cleanedFileUrl = null;
-  if (offset === 0) {
+    let mapping;
     try {
-      const normalized = rows.map((r) => ({
-        studentId: r.studentId || '',
-        firstName: r.firstName || '',
-        lastName: r.lastName || '',
-        class: r.class || '',
-        stream: r.stream || '',
-        gender: r.gender || '',
-        subject: r.subject || '',
-        extraDetail: r.extraDetail || '',
-      }));
-      const csv = buildCleanedCsv(normalized, effectiveNameOrder);
-      const csvBytes = utf8ToBytes(csv);
-      const filename = `${safeBaseName(
-        (file.name || 'roster').replace(/\.[^.]+$/, '')
-      )}_cleaned.csv`;
-      const uploaded = await uploadBufferToCloudinary(env, csvBytes, filename, {
-        folder: `edutraceug/roster-uploads/${schoolId}/cleaned`,
-      });
-      cleanedFileUrl = uploaded.secure_url;
+      mapping = await verifySignedToken(env, mappingStateRaw);
     } catch (err) {
-      // Do not block the import if the cleaned-file upload fails.
-      console.error('[roster-worker] cleaned-file upload failed:', err && err.message);
-      cleanedFileUrl = null;
+      throw new HttpError(400, 'mappingState is required to continue this upload.');
     }
-  }
+    if (mapping.schoolId !== schoolId || mapping.recordType !== recordType) {
+      throw new HttpError(400, 'mappingState is required to continue this upload.');
+    }
+    if (typeof mapping.offsetCheck !== 'undefined' && mapping.offsetCheck !== null) {
+      // optional consistency check left for future use
+    }
 
-  /* ---- 12. Process rows ---- */
-  const report = await processRosterRows({
-    env,
-    schoolId,
-    recordType,
-    fileClass,
-    fileStream,
-    rows,
-    offset,
-    batchId,
-    cloudinaryUrl,
-    uid: user.uid,
-    nameOrder: effectiveNameOrder,
-    cleanedFileUrl,
-  });
+    const columns = {
+      headerRowIndex: mapping.headerRowIndex,
+      map: sanitizeGroqColumnMap(mapping.columnMap) || {},
+      score: 0,
+      positional: mapping.headerRowIndex === -1,
+    };
+    const effNameOrder = sanitizeGroqNameOrder(mapping.nameOrder) || 'first_last';
+    const effSubjectSeparator =
+      typeof mapping.subjectSeparator === 'string' &&
+      Object.prototype.hasOwnProperty.call(SUBJECT_SEPARATORS, mapping.subjectSeparator)
+        ? mapping.subjectSeparator
+        : 'comma';
+    const effGenderMap =
+      mapping.genderMap && typeof mapping.genderMap === 'object' ? mapping.genderMap : null;
+    const effFileClass = strOrEmpty(mapping.class) || fileClass;
+    const effFileStream = strOrEmpty(mapping.stream) || fileStream;
 
-  /* ---- 13. Batch progress ---- */
-  const now = nowIso();
-  const batchStatus = report.remaining === 0 ? 'complete' : 'in_progress';
+    const rows = extractRowsFromMatrix(
+      matrix,
+      columns,
+      effFileClass,
+      effFileStream,
+      effNameOrder,
+      effSubjectSeparator,
+      effGenderMap
+    );
 
-  if (offset === 0) {
-    await env.DB.prepare(
-      `INSERT INTO roster_batches
-         (school_id, id, record_type, class_name, stream, uploaded_by, uploaded_at,
-          file_name, file_size, sheet_name, total_rows, header_row_index, status,
-          created_count, updated_count, unchanged_count, rejected_count,
-          last_processed_offset, cloudinary_url, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(school_id, id) DO UPDATE SET
-         record_type = excluded.record_type,
-         class_name = excluded.class_name,
-         stream = excluded.stream,
-         uploaded_by = excluded.uploaded_by,
-         uploaded_at = excluded.uploaded_at,
-         file_name = excluded.file_name,
-         file_size = excluded.file_size,
-         sheet_name = excluded.sheet_name,
-         total_rows = excluded.total_rows,
-         header_row_index = excluded.header_row_index,
-         status = excluded.status,
-         created_count = excluded.created_count,
-         updated_count = excluded.updated_count,
-         unchanged_count = excluded.unchanged_count,
-         rejected_count = excluded.rejected_count,
-         last_processed_offset = excluded.last_processed_offset,
-         cloudinary_url = excluded.cloudinary_url,
-         completed_at = excluded.completed_at`
-    )
-      .bind(
-        schoolId,
-        batchId,
-        recordType,
-        fileClass,
-        fileStream,
-        user.uid,
-        now,
-        file.name || '',
-        file.size,
-        sheetName,
-        rows.length,
-        columns.headerRowIndex,
-        batchStatus,
-        report.created,
-        report.updated,
-        report.unchanged,
-        report.rejected.length,
-        report.nextOffset,
-        cloudinaryUrl,
-        report.remaining === 0 ? now : null
-      )
-      .run();
-  } else {
+    if (rows.length === 0) {
+      throw new UploadValidationError(
+        'No data rows found. The file must contain a header row (first name, last name, class, ...) followed by data rows.'
+      );
+    }
+
+    const report = await processRosterRows({
+      env,
+      schoolId,
+      recordType,
+      fileClass: effFileClass,
+      fileStream: effFileStream,
+      rows,
+      offset,
+      batchId,
+      cloudinaryUrl,
+      uid: user.uid,
+      subjectSeparator: effSubjectSeparator,
+      genderMap: effGenderMap,
+      cleanedFileUrl: null,
+    });
+
+    const now = nowIso();
+    const batchStatus = report.remaining === 0 ? 'complete' : 'in_progress';
+
     await env.DB.prepare(
       `UPDATE roster_batches
        SET cloudinary_url = ?,
@@ -1902,14 +1830,284 @@ async function handleUploadRoster(request, env) {
         batchId
       )
       .run();
+
+    if (report.remaining === 0) {
+      await refreshClasses(env, schoolId);
+    }
+
+    const response = {
+      status: 'ok',
+      processed: report.processed,
+      remaining: report.remaining,
+      nextOffset: report.nextOffset,
+      created: report.created,
+      updated: report.updated,
+      unchanged: report.unchanged,
+      rejected: report.rejected,
+      batchId,
+    };
+    if (report.duplicates && report.duplicates.length > 0) {
+      response.duplicates = report.duplicates;
+    }
+    if (report.remaining > 0) {
+      response.mappingState = mappingStateRaw;
+    }
+    return jsonResponse(response);
   }
 
-  /* ---- 14. Refresh class aggregates — only after the last chunk (whole school) ---- */
+  /* ---- 8. OFFSET 0: rule-based detection ---- */
+  let columns = detectColumns(matrix, fileClass);
+
+  /* ---- 9. Confirmed answers from a previous needs_answers response ---- */
+  let answeredClass = null;
+  let answeredStream = null;
+  let answeredHeaderRowIndex = null;
+  let answeredNameOrder = null;
+  let answeredColumnMap = null;
+  let answeredSubjectSeparator = null;
+  let answeredGenderMap = null;
+
+  if (stateTokenRaw) {
+    const state = await verifySignedToken(env, stateTokenRaw);
+    if (state.schoolId !== schoolId || state.recordType !== recordType) {
+      throw new HttpError(400, 'State token does not match this upload.');
+    }
+    let answers = {};
+    if (answersRaw) {
+      try {
+        answers = JSON.parse(answersRaw);
+      } catch {
+        throw new HttpError(400, '"answers" must be valid JSON.');
+      }
+    }
+    const validated = validateAnswers(answers);
+    answeredClass = validated.class;
+    answeredStream = validated.stream;
+    answeredHeaderRowIndex = validated.headerRowIndex;
+    answeredNameOrder = validated.nameOrder;
+    answeredColumnMap = validated.columnMap;
+    answeredSubjectSeparator = validated.subjectSeparator;
+    answeredGenderMap = validated.genderMap;
+
+    // Base proposal comes from the signed state.
+    const proposed = state.proposed || {};
+    if (answeredHeaderRowIndex === null) {
+      const v = sanitizeGroqHeaderRowIndex(proposed.headerRowIndex);
+      if (v !== null) answeredHeaderRowIndex = v;
+    }
+    if (answeredNameOrder === null) {
+      const v = sanitizeGroqNameOrder(proposed.nameOrder);
+      if (v !== null) answeredNameOrder = v;
+    }
+    if (answeredColumnMap === null) {
+      answeredColumnMap = sanitizeGroqColumnMap(proposed.columnMap) || {};
+    } else {
+      const base = sanitizeGroqColumnMap(proposed.columnMap) || {};
+      answeredColumnMap = { ...base, ...answeredColumnMap };
+    }
+  }
+
+  if (answeredHeaderRowIndex !== null || answeredColumnMap !== null) {
+    columns = {
+      headerRowIndex:
+        answeredHeaderRowIndex !== null ? answeredHeaderRowIndex : columns.headerRowIndex,
+      map: answeredColumnMap !== null ? answeredColumnMap : columns.map,
+      score: 0,
+      positional:
+        (answeredHeaderRowIndex !== null ? answeredHeaderRowIndex : columns.headerRowIndex) === -1,
+    };
+  }
+
+  const effectiveNameOrder =
+    answeredNameOrder || (rawNameOrder === 'last_first' ? 'last_first' : 'first_last');
+  const effectiveFileClass = answeredClass || fileClass;
+  const effectiveFileStream = answeredStream || fileStream;
+  const effectiveSubjectSeparator = answeredSubjectSeparator || 'comma';
+  const effectiveGenderMap = answeredGenderMap || null;
+
+  /* ---- 10. Groq clarifying step (only when unclear and no confirmed answers) ---- */
+  if (
+    !stateTokenRaw &&
+    !answeredColumnMap &&
+    needsGroqClarification(columns, effectiveFileClass, matrix, recordType)
+  ) {
+    const sampleRows = matrix
+      .slice(0, GROQ_MAX_SAMPLE_ROWS)
+      .map((r) => (Array.isArray(r) ? r.map((c) => String(c ?? '')) : []));
+
+    const groq = await callGroqForClarification(env, sampleRows, recordType, columns);
+
+    if (groq) {
+      const proposedHeaderRowIndex =
+        groq.headerRowIndex !== null ? groq.headerRowIndex : columns.headerRowIndex;
+      const proposedMap = { ...columns.map, ...(groq.columnMap || {}) };
+      const proposedNameOrder = groq.nameOrder || effectiveNameOrder;
+
+      const questions = groq.questions || [];
+      if (questions.length > 0) {
+        const state = await createSignedToken(
+          env,
+          {
+            schoolId,
+            recordType,
+            fileClass,
+            fileStream,
+            proposed: {
+              headerRowIndex: proposedHeaderRowIndex,
+              columnMap: proposedMap,
+              nameOrder: proposedNameOrder,
+            },
+          },
+          STATE_TTL_MS
+        );
+
+        const sampleMatrix = matrix
+          .slice(0, GROQ_MAX_SAMPLE_ROWS)
+          .map((r) => (Array.isArray(r) ? r : []));
+
+        return jsonResponse({
+          status: 'needs_answers',
+          questions: questions.map((q) => ({
+            id: q.id,
+            text: buildQuestionText(q.id),
+            options: q.options,
+          })),
+          state,
+          sample: sampleMatrix,
+        });
+      }
+
+      columns = {
+        headerRowIndex: proposedHeaderRowIndex,
+        map: proposedMap,
+        score: 0,
+        positional: proposedHeaderRowIndex === -1,
+      };
+    }
+  }
+
+  /* ---- 11. Extract rows using the final mapping ---- */
+  const rows = extractRowsFromMatrix(
+    matrix,
+    columns,
+    effectiveFileClass,
+    effectiveFileStream,
+    effectiveNameOrder,
+    effectiveSubjectSeparator,
+    effectiveGenderMap
+  );
+
+  if (rows.length === 0) {
+    throw new UploadValidationError(
+      'No data rows found. The file must contain a header row (first name, last name, class, ...) followed by data rows.'
+    );
+  }
+
+  /* ---- 12. Build a cleaned copy and upload it (offset 0 only) ---- */
+  let cleanedFileUrl = null;
+  try {
+    const normalized = rows.map((r) => ({
+      studentId: r.studentId || '',
+      firstName: r.firstName || '',
+      lastName: r.lastName || '',
+      class: r.class || '',
+      stream: r.stream || '',
+      gender: r.gender || '',
+      subject: r.subject || '',
+      extraDetail: r.extraDetail || '',
+    }));
+    const csv = buildCleanedCsv(normalized);
+    const csvBytes = utf8ToBytes(csv);
+    const filename = `${safeBaseName(
+      (file.name || 'roster').replace(/\.[^.]+$/, '')
+    )}_cleaned.csv`;
+    const uploaded = await uploadBufferToCloudinary(env, csvBytes, filename, {
+      folder: `edutraceug/roster-uploads/${schoolId}/cleaned`,
+    });
+    cleanedFileUrl = uploaded.secure_url;
+  } catch (err) {
+    console.error('[roster-worker] cleaned-file upload failed:', err && err.message);
+    cleanedFileUrl = null;
+  }
+
+  /* ---- 13. Process rows ---- */
+  const report = await processRosterRows({
+    env,
+    schoolId,
+    recordType,
+    fileClass: effectiveFileClass,
+    fileStream: effectiveFileStream,
+    rows,
+    offset,
+    batchId,
+    cloudinaryUrl,
+    uid: user.uid,
+    subjectSeparator: effectiveSubjectSeparator,
+    genderMap: effectiveGenderMap,
+    cleanedFileUrl,
+  });
+
+  /* ---- 14. Batch progress ---- */
+  const now = nowIso();
+  const batchStatus = report.remaining === 0 ? 'complete' : 'in_progress';
+
+  await env.DB.prepare(
+    `INSERT INTO roster_batches
+       (school_id, id, record_type, class_name, stream, uploaded_by, uploaded_at,
+        file_name, file_size, sheet_name, total_rows, header_row_index, status,
+        created_count, updated_count, unchanged_count, rejected_count,
+        last_processed_offset, cloudinary_url, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(school_id, id) DO UPDATE SET
+       record_type = excluded.record_type,
+       class_name = excluded.class_name,
+       stream = excluded.stream,
+       uploaded_by = excluded.uploaded_by,
+       uploaded_at = excluded.uploaded_at,
+       file_name = excluded.file_name,
+       file_size = excluded.file_size,
+       sheet_name = excluded.sheet_name,
+       total_rows = excluded.total_rows,
+       header_row_index = excluded.header_row_index,
+       status = excluded.status,
+       created_count = excluded.created_count,
+       updated_count = excluded.updated_count,
+       unchanged_count = excluded.unchanged_count,
+       rejected_count = excluded.rejected_count,
+       last_processed_offset = excluded.last_processed_offset,
+       cloudinary_url = excluded.cloudinary_url,
+       completed_at = excluded.completed_at`
+  )
+    .bind(
+      schoolId,
+      batchId,
+      recordType,
+      effectiveFileClass,
+      effectiveFileStream,
+      user.uid,
+      now,
+      file.name || '',
+      file.size,
+      sheetName,
+      rows.length,
+      columns.headerRowIndex,
+      batchStatus,
+      report.created,
+      report.updated,
+      report.unchanged,
+      report.rejected.length,
+      report.nextOffset,
+      cloudinaryUrl,
+      report.remaining === 0 ? now : null
+    )
+    .run();
+
+  /* ---- 15. Refresh class aggregates — only after the last chunk ---- */
   if (report.remaining === 0) {
     await refreshClasses(env, schoolId);
   }
 
-  /* ---- 15. Response ---- */
+  /* ---- 16. Response ---- */
   const response = {
     status: 'ok',
     processed: report.processed,
@@ -1927,6 +2125,26 @@ async function handleUploadRoster(request, env) {
   if (report.cleanedFileUrl) {
     response.cleanedFileUrl = report.cleanedFileUrl;
   }
+
+  if (report.remaining > 0) {
+    const mappingState = await createSignedToken(
+      env,
+      {
+        schoolId,
+        recordType,
+        headerRowIndex: columns.headerRowIndex,
+        columnMap: columns.map,
+        nameOrder: effectiveNameOrder,
+        class: effectiveFileClass,
+        stream: effectiveFileStream,
+        subjectSeparator: effectiveSubjectSeparator,
+        genderMap: effectiveGenderMap,
+      },
+      MAPPING_STATE_TTL_MS
+    );
+    response.mappingState = mappingState;
+  }
+
   return jsonResponse(response);
 }
 
@@ -1987,7 +2205,7 @@ function cleanStudentFields(input) {
     subjects: Array.isArray(input.subjects)
       ? input.subjects.map(s).filter(Boolean)
       : input.subjects !== undefined
-      ? splitList(input.subjects)
+      ? splitList(input.subjects, 'comma')
       : undefined,
   };
 
@@ -2013,7 +2231,6 @@ async function handleRosterList(request, env) {
   const cls = strOrEmpty(body.class);
   const stream = strOrEmpty(body.stream);
   const qRaw = strOrEmpty(body.q);
-  const q = qRaw.toLowerCase();
   const rawLimit =
     body.limit === undefined || body.limit === null ? LIST_DEFAULT_LIMIT : Number(body.limit);
   const limit = Math.min(
@@ -2034,17 +2251,26 @@ async function handleRosterList(request, env) {
     params.push(stream);
   }
 
-  // q search — four binds, no template-string interpolation.
-  if (q) {
-    const lower = q;
-    const upper = q + SENTINEL;
-    where.push(
-      `((name_key >= ? AND name_key < ?) OR (lower(last_name) >= ? AND lower(last_name) < ?))`
-    );
-    params.push(lower, upper, lower, upper);
+  // Word-prefix search on name_key: every query word must match the START of
+  // some word inside the student's name_key. We pad with a leading space so
+  // the first word of name_key also matches.
+  if (qRaw) {
+    const words = qRaw
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 4);
+    for (const w of words) {
+      const escaped = w
+        .replace(/\\/g, '\\\\')
+        .replace(/%/g, '\\%')
+        .replace(/_/g, '\\_');
+      where.push(`(' ' || name_key) LIKE ? ESCAPE '\\'`);
+      params.push('% ' + escaped + '%');
+    }
   }
 
-  // Teacher "assigned" scope using EXISTS (json_each).
+  // Teacher "assigned" scope
   const scope = await getTeacherScope(env, schoolId, user);
   if (scope) {
     if (scope.streamOnly.length === 0 && scope.classOnly.length === 0) {
@@ -2066,7 +2292,7 @@ async function handleRosterList(request, env) {
     where.push(`(${parts.join(' OR ')})`);
   }
 
-  // Cursor covers (class_name, stream, last_name, first_name, id).
+  // Cursor
   if (cursor) {
     const cparts = cursor.split('\x1f');
     if (cparts.length === 5) {
@@ -2127,7 +2353,6 @@ async function handleRosterClasses(request, env) {
   const where = ['school_id = ?'];
   const params = [schoolId];
 
-  // Teacher "assigned" scope.
   const scope = await getTeacherScope(env, schoolId, user);
   if (scope) {
     if (scope.streamOnly.length === 0 && scope.classOnly.length === 0) {
@@ -2185,7 +2410,6 @@ async function handleRosterUpdate(request, env) {
     throw new HttpError(400, 'Only student records can be edited here.');
   }
 
-  // Accept subjectsText as a fallback.
   const fields = { ...(body.fields || {}) };
   if (fields.subjects === undefined && body.subjectsText !== undefined) {
     fields.subjects = body.subjectsText;
@@ -2197,7 +2421,6 @@ async function handleRosterUpdate(request, env) {
   const cleaned = cleanStudentFields(fields);
   if (cleaned.errors.length) throw new HttpError(400, cleaned.errors.join('; '));
 
-  // Preserve existing subjects if none sent.
   let subjects;
   if (cleaned.hasSubjects && cleaned.value.subjects !== undefined) {
     subjects = cleaned.value.subjects;
@@ -2234,7 +2457,6 @@ async function handleRosterUpdate(request, env) {
     )
     .run();
 
-  // Refresh only when class/stream/subjects changed; refresh both old and new class.
   const nextSubjectsJson = JSON.stringify(subjects);
   const classChanged = cleaned.value.class !== prevClass || cleaned.value.stream !== prevStream;
   const subjectsChanged = nextSubjectsJson !== prevSubjectsJson;
@@ -2270,7 +2492,6 @@ async function handleRosterAdd(request, env) {
     cleaned.push(value);
   }
 
-  // Duplicate pre-check using json_each (avoids the 100-bind ceiling).
   const classes = [...new Set(cleaned.map((v) => v.class))];
   const existingSet = new Set();
   if (classes.length > 0) {
@@ -2338,7 +2559,6 @@ async function handleRosterAdd(request, env) {
       .run();
   }
 
-  // Refresh only classes touched by this add.
   const touched = [...new Set(cleaned.map((v) => v.class).filter(Boolean))];
   if (touched.length > 0) {
     await refreshClasses(env, schoolId, touched);
@@ -2375,6 +2595,49 @@ async function handleRosterDelete(request, env) {
   return jsonResponse({ status: 'ok' });
 }
 
+// ---- /roster/rebuild-keys ----
+async function handleRosterRebuildKeys(request, env) {
+  const user = await requireUser(request, ['schoolAdmin']);
+  const { schoolId } = await readRosterBody(request, user);
+
+  const res = await env.DB.prepare(
+    `SELECT id, first_name, last_name, name_key
+     FROM roster
+     WHERE school_id = ?`
+  )
+    .bind(schoolId)
+    .all();
+
+  const all = res.results || [];
+  let scanned = 0;
+  let updated = 0;
+
+  const stmts = [];
+  const flush = async () => {
+    if (stmts.length === 0) return;
+    await env.DB.batch(stmts);
+    stmts.length = 0;
+  };
+
+  for (const r of all) {
+    scanned += 1;
+    const nextKey = nameKey(r.first_name, r.last_name);
+    if (nextKey === (r.name_key || '')) continue;
+    updated += 1;
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE roster SET name_key = ? WHERE school_id = ? AND id = ?`
+      ).bind(nextKey, schoolId, r.id)
+    );
+    if (stmts.length >= REBUILD_BATCH_SIZE) {
+      await flush();
+    }
+  }
+  await flush();
+
+  return jsonResponse({ status: 'ok', scanned, updated });
+}
+
 // ==================================================================
 // Router
 // ==================================================================
@@ -2386,6 +2649,7 @@ const POST_ROUTES = {
   '/roster/update': handleRosterUpdate,
   '/roster/add': handleRosterAdd,
   '/roster/delete': handleRosterDelete,
+  '/roster/rebuild-keys': handleRosterRebuildKeys,
 };
 
 export default {
