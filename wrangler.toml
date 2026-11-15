@@ -1,3 +1,10 @@
 name = "edutraceug-roster-worker"
 main = "worker.js"
-compatibility_date = "2026-09-01"
+# Must be today's date or earlier, cannot be in the future
+compatibility_date = "2026-11-15" 
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "edutraceug-db"
+database_id = "4ec96f2c-83de-45ab-8b93-5c97e6ef5032"
