@@ -1,6 +1,6 @@
 /* ==================================================================
  * edutraceug-roster-worker — Cloudflare Worker (D1 edition)
- * Single-file build.
+ * Single-file build.Played well
  *
  * Accepts a school's student or teacher roster (xlsx/xls/xlsm/xltx/xltm/csv),
  * virus-scans it via Cloudmersive, archives the raw file to Cloudinary,
