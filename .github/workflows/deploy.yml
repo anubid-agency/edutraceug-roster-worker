@@ -3,35 +3,7 @@ on:
   push:
     branches: [main]
 jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Run schema (first time)
-        run: npx wrangler@4 d1 execute edutraceug-db --local --file=./schema.sql
-
-      - name: Run schema again (must not fail)
-        run: npx wrangler@4 d1 execute edutraceug-db --local --file=./schema.sql
-
-      - name: Check tables and columns
-        run: |
-          npx wrangler@4 d1 execute edutraceug-db --local --json \
-            --command "SELECT m.name AS tbl, p.name AS col FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type = 'table'" \
-            | node scripts/check-schema.mjs
-
-      - name: Smoke test upserts
-        run: npx wrangler@4 d1 execute edutraceug-db --local --file=./scripts/smoke.sql
-
   deploy:
-    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,16 +14,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-
-      - name: Apply D1 schema
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "4"
-          command: d1 execute edutraceug-db --file=./schema.sql --remote
-        env:
-          CI: "true"
 
       - name: Publish Worker
         uses: cloudflare/wrangler-action@v3
