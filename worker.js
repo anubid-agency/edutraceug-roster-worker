@@ -1,17 +1,17 @@
 /* ==================================================================
- * edutraceug-roster-worker — Cloudflare Worker
+ * edutraceug-roster-worker — Cloudflare Worker (D1 edition)
  * Single-file build.
  *
  * Accepts a school's student or teacher roster (xlsx/xls/xlsm/xltx/xltm/csv),
  * virus-scans it via Cloudmersive, archives the raw file to Cloudinary,
- * parses it with SheetJS, and merges structured rows into Firestore at
- * schools/{schoolId}/roster.
+ * parses it with SheetJS, and merges structured rows into Cloudflare D1
+ * (database edutraceug-db, binding DB).
  *
  * Also serves the roster viewer/editor endpoints:
- *   POST /roster/list | /roster/update | /roster/add | /roster/delete
+ *   POST /roster/list | /roster/classes | /roster/update | /roster/add | /roster/delete
  *
- * All Firebase / Cloudinary / HTTP-server concerns are implemented against
- * REST APIs using `crypto.subtle` and `fetch`, not Node SDKs.
+ * Firebase ID tokens are verified with crypto.subtle against Google's JWKS.
+ * No service accounts, no OAuth, no Firestore.
  * ================================================================== */
 
 import * as XLSX from 'xlsx';
@@ -20,8 +20,8 @@ import * as XLSX from 'xlsx';
 // Constants
 // ==================================================================
 
-// Each call loads the school's roster ONCE and matches rows in memory, so a call
-// costs ~8 outgoing requests regardless of size (free-plan limit is 50).
+const FIREBASE_PROJECT_ID = 'edutrace-ug';
+
 const MAX_ROWS_PER_CALL = 300;
 const DEFAULT_MAX_FILE_SIZE_MB = 25;
 const ACCEPTED_EXTENSIONS = ['.xlsx', '.xls', '.xlsm', '.xltx', '.xltm', '.csv'];
@@ -42,36 +42,25 @@ const ACCEPTED_MIME = new Set([
 
 const GOOGLE_JWKS_URL =
   'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
-const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-const FIRESTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
 
 const CLOUDMERSIVE_SCAN_URL = 'https://api.cloudmersive.com/virus/scan/file';
 const SCAN_TIMEOUT_MS = 60_000;
 
-const JWKS_TTL_MS = 6 * 60 * 60 * 1000;   // 6h
-const OAUTH_SAFETY_SECONDS = 120;         // refresh 2 min before expiry
+const JWKS_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 const RECORD_TYPES = new Set(['student', 'teacher']);
 
-// Fields that participate in exact-match diffing.
-const DATA_FIELDS = [
-  'recordType',
-  'firstName',
-  'lastName',
-  'class',
-  'gender',
-  'stream',
-  'extraDetail',
-  'studentId',
-  'subjects',
-];
+const LIST_DEFAULT_LIMIT = 100;
+const LIST_MAX_LIMIT = 200;
+const ADD_MAX_ROWS = 100;
+
+const SENTINEL = '\uffff';
+
 // ==================================================================
-// Module-level caches (persist for the lifetime of a Worker isolate)
+// Module-level caches
 // ==================================================================
 
 let jwksCache = { keys: null, expiresAt: 0 };
-const oauthCache = new Map(); // client_email → { token, expiresAt }
-let saCache = { raw: null, parsed: null };
 
 // ==================================================================
 // Errors
@@ -97,7 +86,7 @@ class UploadValidationError extends HttpError {
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'POST, OPTIONS',
+  'access-control-allow-methods': 'POST, GET, OPTIONS',
   'access-control-allow-headers': 'authorization, content-type',
   'access-control-max-age': '86400',
 };
@@ -125,17 +114,6 @@ function utf8ToBytes(str) {
   return new TextEncoder().encode(str);
 }
 
-function bytesToB64url(bytes) {
-  const arr = new Uint8Array(bytes);
-  let bin = '';
-  for (let i = 0; i < arr.length; i += 1) bin += String.fromCharCode(arr[i]);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function utf8ToB64url(str) {
-  return bytesToB64url(utf8ToBytes(str));
-}
-
 function b64urlToBytes(str) {
   const norm = str.replace(/-/g, '+').replace(/_/g, '/');
   const pad = norm.length % 4 === 0 ? norm : norm + '='.repeat(4 - (norm.length % 4));
@@ -147,13 +125,6 @@ function b64urlToBytes(str) {
 
 function b64urlToString(str) {
   return new TextDecoder().decode(b64urlToBytes(str));
-}
-
-function base64ToBytes(b64) {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 function safeBaseName(name) {
@@ -177,47 +148,8 @@ function strOrEmpty(v) {
   return v === undefined || v === null ? '' : String(v).trim();
 }
 
-// ==================================================================
-// Service account loading / caching
-// ==================================================================
-
-function getServiceAccount(env) {
-  const raw =
-    env['ACCOUNT-SERVICE-FIREBASE'] ||
-    env.ACCOUNT_SERVICE_FIREBASE;
-
-  if (!raw || !String(raw).trim()) {
-    throw new HttpError(
-      500,
-      'ACCOUNT-SERVICE-FIREBASE is not configured (checked ACCOUNT-SERVICE-FIREBASE and ACCOUNT_SERVICE_FIREBASE).'
-    );
-  }
-  if (saCache.raw === raw && saCache.parsed) return saCache.parsed;
-
-  const text = String(raw).trim();
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    try {
-      parsed = JSON.parse(atob(text));
-    } catch {
-      throw new HttpError(
-        500,
-        'ACCOUNT-SERVICE-FIREBASE must be a service-account JSON object (raw or base64-encoded).'
-      );
-    }
-  }
-
-  if (!parsed.project_id || !parsed.client_email || !parsed.private_key) {
-    throw new HttpError(
-      500,
-      'ACCOUNT-SERVICE-FIREBASE is missing project_id, client_email, or private_key.'
-    );
-  }
-
-  saCache = { raw, parsed };
-  return parsed;
+function nowIso() {
+  return new Date().toISOString();
 }
 
 // ==================================================================
@@ -284,272 +216,24 @@ async function verifyFirebaseIdToken(idToken, projectId) {
   return payload;
 }
 
-// ==================================================================
-// Google OAuth2: service-account JWT → access token
-// ==================================================================
-
-async function importPrivateKey(pem) {
-  const b64 = String(pem)
-    .replace(/-----BEGIN PRIVATE KEY-----/, '')
-    .replace(/-----END PRIVATE KEY-----/, '')
-    .replace(/\s+/g, '');
-  const der = base64ToBytes(b64);
-  return crypto.subtle.importKey(
-    'pkcs8',
-    der,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-}
-
-async function signJwtRs256(payload, privateKeyPem) {
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const headerB64 = utf8ToB64url(JSON.stringify(header));
-  const payloadB64 = utf8ToB64url(JSON.stringify(payload));
-  const signingInput = `${headerB64}.${payloadB64}`;
-
-  const key = await importPrivateKey(privateKeyPem);
-  const sigBuf = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    key,
-    utf8ToBytes(signingInput)
-  );
-
-  return `${signingInput}.${bytesToB64url(sigBuf)}`;
-}
-
-async function getAccessToken(env, scope = FIRESTORE_SCOPE) {
-  const sa = getServiceAccount(env);
-  const cacheKey = `${sa.client_email}|${scope}`;
-  const now = Math.floor(Date.now() / 1000);
-
-  const cached = oauthCache.get(cacheKey);
-  if (cached && cached.expiresAt > now + OAUTH_SAFETY_SECONDS) {
-    return cached.token;
+async function requireUser(request, allowedRoles) {
+  const m = (request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) throw new HttpError(401, 'Missing Authorization header.');
+  let claims;
+  try {
+    claims = await verifyFirebaseIdToken(m[1].trim(), FIREBASE_PROJECT_ID);
+  } catch (err) {
+    throw new HttpError(401, `Invalid or expired ID token. (${err.message})`);
   }
-
-  const jwt = await signJwtRs256(
-    {
-      iss: sa.client_email,
-      scope,
-      aud: OAUTH_TOKEN_URL,
-      iat: now,
-      exp: now + 3600,
-    },
-    sa.private_key
-  );
-
-  const body = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    assertion: jwt,
-  });
-
-  const res = await fetch(OAUTH_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new HttpError(502, `Google OAuth token exchange failed (${res.status}): ${text.slice(0, 200)}`);
+  const user = {
+    uid: claims.sub,
+    role: claims.role || null,
+    schoolId: claims.schoolId || null,
+  };
+  if (allowedRoles && !allowedRoles.includes(user.role)) {
+    throw new HttpError(403, `Requires role: ${allowedRoles.join(' or ')}.`);
   }
-
-  const data = await res.json();
-  if (!data.access_token) throw new HttpError(502, 'Google OAuth response missing access_token.');
-
-  const expiresAt = now + (Number(data.expires_in) || 3600);
-  oauthCache.set(cacheKey, { token: data.access_token, expiresAt });
-  return data.access_token;
-}
-
-// ==================================================================
-// Firestore REST — value encoding/decoding
-// ==================================================================
-
-function toFirestoreValue(v) {
-  if (v === undefined || v === null) return { nullValue: null };
-  if (typeof v === 'string') return { stringValue: v };
-  if (typeof v === 'boolean') return { booleanValue: v };
-  if (typeof v === 'number') {
-    if (Number.isInteger(v)) return { integerValue: String(v) };
-    return { doubleValue: v };
-  }
-  if (v instanceof Date) return { timestampValue: v.toISOString() };
-  if (Array.isArray(v)) {
-    return { arrayValue: { values: v.map(toFirestoreValue) } };
-  }
-  if (typeof v === 'object') {
-    const fields = {};
-    for (const [k, val] of Object.entries(v)) fields[k] = toFirestoreValue(val);
-    return { mapValue: { fields } };
-  }
-  return { nullValue: null };
-}
-
-function fromFirestoreValue(fv) {
-  if (!fv) return null;
-  if ('nullValue' in fv) return null;
-  if ('stringValue' in fv) return fv.stringValue;
-  if ('booleanValue' in fv) return fv.booleanValue;
-  if ('integerValue' in fv) return Number(fv.integerValue);
-  if ('doubleValue' in fv) return fv.doubleValue;
-  if ('timestampValue' in fv) return fv.timestampValue;
-  if ('arrayValue' in fv) {
-    const values = fv.arrayValue?.values || [];
-    return values.map(fromFirestoreValue);
-  }
-  if ('mapValue' in fv) {
-    const out = {};
-    const fields = fv.mapValue?.fields || {};
-    for (const [k, v] of Object.entries(fields)) out[k] = fromFirestoreValue(v);
-    return out;
-  }
-  return null;
-}
-
-function toFirestoreFields(obj) {
-  const fields = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === undefined) continue;
-    fields[k] = toFirestoreValue(v);
-  }
-  return fields;
-}
-
-function fromFirestoreDocument(doc) {
-  const out = {};
-  if (!doc || !doc.fields) return out;
-  for (const [k, v] of Object.entries(doc.fields)) out[k] = fromFirestoreValue(v);
-  return out;
-}
-
-// ==================================================================
-// Firestore REST — resource paths and endpoints
-// ==================================================================
-
-function firestoreBase(env) {
-  const sa = getServiceAccount(env);
-  return `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents`;
-}
-
-function docName(env, segments) {
-  const sa = getServiceAccount(env);
-  return `projects/${sa.project_id}/databases/(default)/documents/${segments.join('/')}`;
-}
-
-async function getFirestoreDocument(env, token, segments) {
-  const url = `${firestoreBase(env)}/${segments.map(encodeURIComponent).join('/')}`;
-  const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new HttpError(502, `Firestore GET failed (${res.status}): ${text.slice(0, 200)}`);
-  }
-  return res.json();
-}
-
-async function firestoreRunQuery(env, token, parentSegments, structuredQuery) {
-  const parent = parentSegments.map(encodeURIComponent).join('/');
-  const url = `${firestoreBase(env)}/${parent}:runQuery`;
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ structuredQuery }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new HttpError(502, `Firestore runQuery failed (${res.status}): ${text.slice(0, 200)}`);
-  }
-
-  const rows = await res.json();
-  if (!Array.isArray(rows)) return [];
-  return rows.filter((r) => r && r.document).map((r) => r.document);
-}
-
-async function firestoreCommit(env, token, writes) {
-  const sa = getServiceAccount(env);
-  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents:commit`;
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ writes }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new HttpError(502, `Firestore commit failed (${res.status}): ${text.slice(0, 200)}`);
-  }
-  return res.json();
-}
-
-// ==================================================================
-// Firestore write-queue (batches writes into :commit calls)
-// ==================================================================
-
-class WriteQueue {
-  constructor(env, token, maxPerBatch = 400) {
-    this.env = env;
-    this.token = token;
-    this.maxPerBatch = maxPerBatch;
-    this.writes = [];
-  }
-
-  update(segments, data) {
-    const fieldPaths = Object.keys(data);
-    this.writes.push({
-      update: {
-        name: docName(this.env, segments),
-        fields: toFirestoreFields(data),
-      },
-      updateMask: { fieldPaths },
-    });
-    return this.#maybeFlush();
-  }
-
-  create(segments, data) {
-    this.writes.push({
-      update: {
-        name: docName(this.env, segments),
-        fields: toFirestoreFields(data),
-      },
-      currentDocument: { exists: false },
-    });
-    return this.#maybeFlush();
-  }
-
-  merge(segments, data) {
-    const fieldPaths = Object.keys(data);
-    this.writes.push({
-      update: {
-        name: docName(this.env, segments),
-        fields: toFirestoreFields(data),
-      },
-      updateMask: { fieldPaths },
-    });
-    return this.#maybeFlush();
-  }
-
-  async #maybeFlush() {
-    if (this.writes.length >= this.maxPerBatch) await this.flush();
-  }
-
-  async flush() {
-    if (this.writes.length === 0) return;
-    const chunk = this.writes;
-    this.writes = [];
-    await firestoreCommit(this.env, this.token, chunk);
-  }
+  return user;
 }
 
 // ==================================================================
@@ -597,7 +281,7 @@ async function scanFileForViruses(env, file) {
 }
 
 // ==================================================================
-// Cloudinary raw upload (signed, via REST)
+// Cloudinary raw upload
 // ==================================================================
 
 async function cloudinarySignature(params, apiSecret) {
@@ -626,7 +310,9 @@ async function uploadRawToCloudinary(env, file, { folder }) {
     return dot > 0 ? name.slice(dot).toLowerCase() : '.xlsx';
   })();
 
-  const publicId = `${safeBaseName((file.name || 'roster').replace(/\.[^.]+$/, ''))}_${Date.now()}${parsedExt}`;
+  const publicId = `${safeBaseName(
+    (file.name || 'roster').replace(/\.[^.]+$/, '')
+  )}_${Date.now()}${parsedExt}`;
   const timestamp = Math.floor(Date.now() / 1000);
 
   const signedParams = {
@@ -644,17 +330,14 @@ async function uploadRawToCloudinary(env, file, { folder }) {
   form.append('folder', signedParams.folder);
   form.append('signature', signature);
 
-  const res = await fetch(
-    `https://api.cloudinary.com/v1_1/${cloudName}/raw/upload`,
-    { method: 'POST', body: form }
-  );
+  const res = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/raw/upload`, {
+    method: 'POST',
+    body: form,
+  });
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new HttpError(
-      502,
-      `Cloudinary upload failed (${res.status}): ${text.slice(0, 200)}`
-    );
+    throw new HttpError(502, `Cloudinary upload failed (${res.status}): ${text.slice(0, 200)}`);
   }
 
   const data = await res.json();
@@ -688,8 +371,15 @@ const ALIASES = {
   stream: ['stream', 'section', 'arm', 'division'],
   subject: ['subject', 'subjects', 'subjectcombination', 'combination', 'papers'],
   extraDetail: [
-    'extradetail', 'extra', 'notes', 'note', 'disambiguation',
-    'remark', 'remarks', 'comment', 'comments',
+    'extradetail',
+    'extra',
+    'notes',
+    'note',
+    'disambiguation',
+    'remark',
+    'remarks',
+    'comment',
+    'comments',
   ],
 };
 
@@ -730,9 +420,7 @@ function detectColumns(matrix) {
     }
 
     const hasCore =
-      map.firstName !== undefined &&
-      map.lastName !== undefined &&
-      map.class !== undefined;
+      map.firstName !== undefined && map.lastName !== undefined && map.class !== undefined;
 
     if (hasCore && (!best || score > best.score)) {
       best = { headerRowIndex: r, map, score, positional: false };
@@ -814,7 +502,7 @@ function readRosterRows(buffer) {
 }
 
 // ==================================================================
-// Row validation + merge logic
+// Merge / validation helpers
 // ==================================================================
 
 function splitList(v) {
@@ -834,29 +522,16 @@ function mergeList(a, b) {
   return out;
 }
 
-function buildDesired(recordType, v) {
-  if (recordType === 'teacher') {
-    return {
-      recordType,
-      firstName: v.firstName,
-      lastName: v.lastName,
-      gender: v.gender,
-      extraDetail: v.extraDetail,
-      subjects: v.subjects,
-      classes: [v.class],
-    };
-  }
-  return {
-    recordType,
-    firstName: v.firstName,
-    lastName: v.lastName,
-    class: v.class,
-    gender: v.gender,
-    stream: v.stream,
-    extraDetail: v.extraDetail,
-    studentId: v.studentId || '',
-    subjects: Array.isArray(v.subjects) ? v.subjects : [],
-  };
+function normalizeGender(raw) {
+  const g = String(raw || '').trim().toLowerCase();
+  if (g === 'male' || g === 'm') return 'Male';
+  if (g === 'female' || g === 'f') return 'Female';
+  return '';
+}
+
+function nameKey(firstName, lastName) {
+  const norm = (v) => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return `${norm(firstName)}|${norm(lastName)}`;
 }
 
 function validateAndNormalize(row, fileClass, fileStream, recordType) {
@@ -870,7 +545,12 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
   const extraDetail = row.extraDetail;
   const studentId = row.studentId || '';
 
-  let gender = row.gender || '';
+  let gender = '';
+  const rawGender = String(row.gender || '').trim();
+  if (rawGender) {
+    gender = normalizeGender(rawGender);
+    if (!gender) errors.push('gender must be Male or Female');
+  }
 
   if (!firstName) errors.push('first name is required');
   if (!lastName) errors.push('last name is required');
@@ -878,13 +558,6 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
 
   if (recordType === 'teacher' && subjects.length === 0) {
     errors.push('subject is required');
-  }
-
-  if (gender) {
-    const g = gender.toLowerCase();
-    if (g === 'male' || g === 'm') gender = 'Male';
-    else if (g === 'female' || g === 'f') gender = 'Female';
-    else errors.push('gender must be Male or Female');
   }
 
   if (errors.length > 0) return { errors };
@@ -904,317 +577,181 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
   };
 }
 
-function fieldFilter(fieldPath, op, value) {
-  return {
-    fieldFilter: {
-      field: { fieldPath },
-      op,
-      value,
-    },
-  };
-}
-
-// ---- In-memory roster index (replaces one Firestore query per student) ----
+// ==================================================================
+// Roster matching helpers
+// ==================================================================
 
 function normKey(v) {
   return String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-function rosterKey(recordType, d) {
-  return recordType === 'teacher'
-    ? ['t', normKey(d.firstName), normKey(d.lastName)].join('|')
-    : ['s', normKey(d.firstName), normKey(d.lastName), normKey(d.class), normKey(d.stream)].join('|');
+function exactStudentKey(d) {
+  return [normKey(d.firstName), normKey(d.lastName), normKey(d.class), normKey(d.stream)].join('|');
 }
 
-// Student key without stream: used when an uploaded row has no stream.
 function looseStudentKey(d) {
-  return ['s', normKey(d.firstName), normKey(d.lastName), normKey(d.class)].join('|');
+  return [normKey(d.firstName), normKey(d.lastName), normKey(d.class)].join('|');
 }
 
-async function loadRosterIndex(env, token, schoolId, recordType) {
-  const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
-    from: [{ collectionId: 'roster' }],
-    where: fieldFilter('recordType', 'EQUAL', { stringValue: recordType }),
-  });
-
-  const exact = new Map();
-  const loose = new Map();
-  const push = (map, k, doc) => {
-    if (!map.has(k)) map.set(k, []);
-    map.get(k).push(doc);
-  };
-
-  for (const doc of docs) {
-    const d = fromFirestoreDocument(doc);
-    push(exact, rosterKey(recordType, d), doc);
-    if (recordType === 'student') push(loose, looseStudentKey(d), doc);
-  }
-  return { exact, loose };
-}
-
-function findCandidates(index, recordType, desired) {
-  const hit = index.exact.get(rosterKey(recordType, desired));
-  if (hit && hit.length) return hit;
-  if (recordType === 'student' && !desired.stream) {
-    return index.loose.get(looseStudentKey(desired)) || [];
-  }
-  return [];
-}
-
-function pickBestCandidate(docs, desired) {
-  if (!docs || docs.length === 0) return null;
-
-  const toEntry = (doc) => {
-    const id = doc.name.split('/').pop();
-    return { id, data: fromFirestoreDocument(doc) };
-  };
-
-  const exact = docs.find((doc) => {
-    const d = fromFirestoreDocument(doc);
-    return DATA_FIELDS.every((f) => String(d[f] ?? '') === String(desired[f] ?? ''));
-  });
-  if (exact) return toEntry(exact);
-
-  if (!desired.stream) {
-    const noStream = docs.find((doc) => !fromFirestoreDocument(doc).stream);
-    if (noStream) return toEntry(noStream);
-  }
-
-  return toEntry(docs[0]);
-}
-
-function computeDiff(existingData, desired) {
-  const diff = {};
-  for (const field of DATA_FIELDS) {
-    const cur = existingData[field];
-    const next = desired[field];
-    if (Array.isArray(cur) || Array.isArray(next)) {
-      const a = JSON.stringify(Array.isArray(cur) ? cur : []);
-      const b = JSON.stringify(Array.isArray(next) ? next : []);
-      if (a !== b) diff[field] = Array.isArray(next) ? next : [];
-      continue;
-    }
-    const cs = String(cur ?? '');
-    const ns = String(next ?? '');
-    if (cs !== ns) diff[field] = next;
-  }
-
-  // FIXED: Merges subjects for both students and teachers when updating records in Firestore
-  if (desired.subjects && desired.subjects.length > 0) {
-    const merged = mergeList(existingData.subjects, desired.subjects);
-    const before = Array.isArray(existingData.subjects) ? existingData.subjects.length : 0;
-    if (merged.length !== before) diff.subjects = merged;
-  }
-
-  if (desired.recordType === 'teacher' && desired.classes) {
-    const merged = mergeList(existingData.classes, desired.classes);
-    const before = Array.isArray(existingData.classes) ? existingData.classes.length : 0;
-    if (merged.length !== before) diff.classes = merged;
-  }
-  return diff;
-}
-
-async function processRosterRows({
-  env,
-  token,
-  schoolId,
-  recordType,
-  fileClass = '',
-  fileStream = '',
-  rows,
-  offset,
-  batchId,
-  cloudinaryUrl,
-  uid,
-}) {
-  if (!RECORD_TYPES.has(recordType)) {
-    throw new Error(`Invalid recordType: ${recordType}`);
-  }
-
-  const slice = rows.slice(offset, offset + MAX_ROWS_PER_CALL);
-  const nextOffset = offset + slice.length;
-  const remaining = Math.max(0, rows.length - nextOffset);
-
-  const queue = new WriteQueue(env, token);
-  const index = await loadRosterIndex(env, token, schoolId, recordType);
-
-  let created = 0;
-  let updated = 0;
-  let unchanged = 0;
-  const rejected = [];
-  const now = new Date();
-
-  const groups = new Map();
-  for (const row of slice) {
-    const { errors, value } = validateAndNormalize(row, fileClass, fileStream, recordType);
-
-    if (errors.length > 0) {
-      rejected.push({ row: row.excelRow, reason: errors.join('; ') });
-      continue;
-    }
-
-    const desired = buildDesired(recordType, value);
-    const key = rosterKey(recordType, desired);
-    const g = groups.get(key);
-
-    if (!g) {
-      groups.set(key, desired);
-    } else {
-      // FIXED: Merges subjects for both students and teachers during row aggregation
-      g.subjects = mergeList(g.subjects, desired.subjects);
-
-      if (recordType === 'teacher') {
-        g.classes = mergeList(g.classes, desired.classes);
-      }
-      if (!g.gender && desired.gender) g.gender = desired.gender;
-      if (!g.studentId && desired.studentId) g.studentId = desired.studentId;
-    }
-  }
-
-  for (const desired of groups.values()) {
-    const docs = findCandidates(index, recordType, desired);
-    const existing = pickBestCandidate(docs, desired);
-
-    if (existing) {
-      const diff = computeDiff(existing.data, desired);
-
-      if (Object.keys(diff).length === 0) {
-        unchanged += 1;
-        continue;
-      }
-
-      await queue.update(['schools', schoolId, 'roster', existing.id], {
-        ...diff,
-        batchId,
-        updatedAt: now,
-      });
-      updated += 1;
-    } else {
-      const docId = generateDocId();
-      const data = {
-        ...desired,
-        batchId,
-        cloudinaryUrl,
-        createdBy: uid,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await queue.create(['schools', schoolId, 'roster', docId], data);
-      created += 1;
-    }
-  }
-
-  await queue.flush();
-
-  return {
-    processed: slice.length,
-    remaining,
-    nextOffset,
-    created,
-    updated,
-    unchanged,
-    rejected,
-  };
+function desiredKey(recordType, d) {
+  return recordType === 'teacher'
+    ? [normKey(d.firstName), normKey(d.lastName)].join('|')
+    : exactStudentKey(d);
 }
 
 // ==================================================================
-// File-extension/MIME gate
+// Class-structure / class-subjects refresh (FIX 2 — selective)
 // ==================================================================
 
-function validateFileMetadata(file) {
-  const original = file.name || '';
-  const dot = original.lastIndexOf('.');
-  const ext = dot >= 0 ? original.slice(dot).toLowerCase() : '';
+function placeholdersFor(n) {
+  return Array.from({ length: n }, () => '?').join(',');
+}
 
-  if (ext === '.xlsb') {
-    throw new UploadValidationError(
-      '".xlsb" files are not supported. Please re-save as .xlsx, .xls, .xlsm, .xltx, .xltm or .csv.'
+async function refreshClassStructure(env, schoolId, classNames) {
+  const db = env.DB;
+  if (classNames && classNames.length > 0) {
+    const classes = [...new Set(classNames)];
+    const ph = placeholdersFor(classes.length);
+    await db.batch([
+      db
+        .prepare(`DELETE FROM class_structure WHERE school_id = ? AND class_name IN (${ph})`)
+        .bind(schoolId, ...classes),
+      db
+        .prepare(
+          `INSERT INTO class_structure (school_id, class_name, stream, student_count)
+           SELECT school_id, class_name, stream, COUNT(*)
+           FROM roster
+           WHERE school_id = ? AND record_type = 'student'
+             AND class_name IN (${ph})
+           GROUP BY school_id, class_name, stream`
+        )
+        .bind(schoolId, ...classes),
+    ]);
+  } else {
+    await db.batch([
+      db.prepare(`DELETE FROM class_structure WHERE school_id = ?`).bind(schoolId),
+      db
+        .prepare(
+          `INSERT INTO class_structure (school_id, class_name, stream, student_count)
+           SELECT school_id, class_name, stream, COUNT(*)
+           FROM roster
+           WHERE school_id = ? AND record_type = 'student'
+           GROUP BY school_id, class_name, stream`
+        )
+        .bind(schoolId),
+    ]);
+  }
+}
+
+async function refreshClassSubjects(env, schoolId, classNames) {
+  const db = env.DB;
+  if (classNames && classNames.length > 0) {
+    const classes = [...new Set(classNames)];
+    const ph = placeholdersFor(classes.length);
+    await db.batch([
+      db
+        .prepare(`DELETE FROM class_subjects WHERE school_id = ? AND class_name IN (${ph})`)
+        .bind(schoolId, ...classes),
+      db
+        .prepare(
+          `INSERT INTO class_subjects (school_id, class_name, subject, student_count)
+           SELECT roster.school_id, roster.class_name, je.value, COUNT(DISTINCT roster.id)
+           FROM roster, json_each(roster.subjects_json) je
+           WHERE roster.school_id = ?
+             AND roster.record_type = 'student'
+             AND json_valid(roster.subjects_json)
+             AND roster.class_name IN (${ph})
+           GROUP BY roster.school_id, roster.class_name, je.value`
+        )
+        .bind(schoolId, ...classes),
+    ]);
+  } else {
+    await db.batch([
+      db.prepare(`DELETE FROM class_subjects WHERE school_id = ?`).bind(schoolId),
+      db
+        .prepare(
+          `INSERT INTO class_subjects (school_id, class_name, subject, student_count)
+           SELECT roster.school_id, roster.class_name, je.value, COUNT(DISTINCT roster.id)
+           FROM roster, json_each(roster.subjects_json) je
+           WHERE roster.school_id = ?
+             AND roster.record_type = 'student'
+             AND json_valid(roster.subjects_json)
+           GROUP BY roster.school_id, roster.class_name, je.value`
+        )
+        .bind(schoolId),
+    ]);
+  }
+}
+
+async function refreshClasses(env, schoolId, classNames) {
+  await refreshClassStructure(env, schoolId, classNames);
+  await refreshClassSubjects(env, schoolId, classNames);
+}
+
+// ==================================================================
+// Teacher "assigned" scope helper
+// ==================================================================
+
+// Returns null if teacher has full access; otherwise an object with
+// streamOnly (array of {class, stream}) and classOnly (array of class names).
+// The caller passes these to build a WHERE clause. Empty arrays => no access.
+async function getTeacherScope(env, schoolId, user) {
+  if (user.role !== 'teacher') return null;
+  const settings = await env.DB.prepare(
+    `SELECT teacher_access_mode FROM school_settings WHERE school_id = ?`
+  )
+    .bind(schoolId)
+    .first();
+  const mode = settings ? settings.teacher_access_mode : 'open';
+  if (mode !== 'assigned') return null;
+
+  const assignRows = await env.DB.prepare(
+    `SELECT DISTINCT class_name, stream FROM teacher_assignments
+     WHERE school_id = ? AND uid = ?`
+  )
+    .bind(schoolId, user.uid)
+    .all();
+  const assigns = assignRows.results || [];
+  const streamOnly = assigns.filter((a) => a.stream).map((a) => ({
+    class: a.class_name,
+    stream: a.stream,
+  }));
+  const classOnly = assigns.filter((a) => !a.stream).map((a) => a.class_name);
+  return { streamOnly, classOnly };
+}
+
+// Appends the teacher scope predicate (if any) to a where/params pair.
+// FIX 4 — EXISTS (SELECT 1 FROM json_each(?) …) for the stream-bearing part.
+function applyTeacherScope(where, params, scope) {
+  if (!scope) return;
+  const parts = [];
+  if (scope.streamOnly.length > 0) {
+    parts.push(
+      `EXISTS (SELECT 1 FROM json_each(?) j
+               WHERE j.value->>'class' = roster.class_name
+                 AND j.value->>'stream' = roster.stream)`
     );
+    params.push(JSON.stringify(scope.streamOnly));
   }
-
-  if (!ACCEPTED_EXTENSIONS.includes(ext)) {
-    throw new UploadValidationError(
-      `Unsupported file type "${ext || '(no extension)'}". Accepted: ${ACCEPTED_EXTENSIONS.join(', ')}.`
-    );
+  if (scope.classOnly.length > 0) {
+    parts.push(`roster.class_name IN (SELECT value FROM json_each(?))`);
+    params.push(JSON.stringify(scope.classOnly));
   }
-
-  const mime = String(file.type || '').toLowerCase();
-  if (!ACCEPTED_MIME.has(mime)) {
-    throw new UploadValidationError(
-      `Unsupported content type "${file.type}". Please upload an Excel or CSV file.`
-    );
+  if (parts.length === 0) {
+    // No assignments → no rows.
+    where.push('0 = 1');
+    return;
   }
+  where.push(`(${parts.join(' OR ')})`);
 }
 
 // ==================================================================
-// Batch (rosterUploads) helpers
-// ==================================================================
-
-async function findRecentBatch(env, token, schoolId, { uid, recordType, fileClass, fileStream }) {
-  const structuredQuery = {
-    from: [{ collectionId: 'rosterUploads' }],
-    where: fieldFilter('uploadedBy', 'EQUAL', { stringValue: uid }),
-    limit: 50,
-  };
-
-  const docs = await firestoreRunQuery(env, token, ['schools', schoolId], structuredQuery);
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-
-  let best = null;
-  let bestTs = -1;
-
-  for (const doc of docs) {
-    const d = fromFirestoreDocument(doc);
-    if (d.recordType !== recordType) continue;
-    if (strOrEmpty(d.class) !== strOrEmpty(fileClass)) continue;
-    if (strOrEmpty(d.stream) !== strOrEmpty(fileStream)) continue;
-
-    const ts = typeof d.uploadedAt === 'string' ? Date.parse(d.uploadedAt) : 0;
-    if (!Number.isFinite(ts) || ts < cutoff) continue;
-    if (ts > bestTs) {
-      bestTs = ts;
-      best = { id: doc.name.split('/').pop(), data: d };
-    }
-  }
-
-  return best;
-}
-
-// ==================================================================
-// /upload-roster handler
+// /upload-roster
 // ==================================================================
 
 async function handleUploadRoster(request, env) {
   /* ---- 0. Auth ---- */
-  const authHeader = request.headers.get('authorization') || '';
-  const authMatch = authHeader.match(/^Bearer\s+(.+)$/i);
-  if (!authMatch) {
-    throw new HttpError(
-      401,
-      'Missing Authorization header. Expected: Authorization: Bearer <Firebase ID token>'
-    );
-  }
-
-  const sa = getServiceAccount(env);
-  const projectId = sa.project_id;
-
-  let claims;
-  try {
-    claims = await verifyFirebaseIdToken(authMatch[1].trim(), projectId);
-  } catch (err) {
-    throw new HttpError(401, `Invalid or expired ID token. (${err.message})`);
-  }
-
-  const user = {
-    uid: claims.sub,
-    role: claims.role || null,
-    schoolId: claims.schoolId || null,
-  };
-
-  if (user.role !== 'schoolAdmin') {
-    throw new HttpError(403, 'This endpoint requires role "schoolAdmin".');
-  }
+  const user = await requireUser(request, ['schoolAdmin']);
 
   /* ---- 1. Multipart parse ---- */
   let form;
@@ -1252,8 +789,7 @@ async function handleUploadRoster(request, env) {
     throw new UploadValidationError('"offset" must be a non-negative integer.');
   }
 
-  const maxBytes =
-    (Number(env.MAX_FILE_SIZE_MB) || DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
+  const maxBytes = (Number(env.MAX_FILE_SIZE_MB) || DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
   if (file.size > maxBytes) {
     throw new UploadValidationError(
       `File is too large (${file.size} bytes; max ${maxBytes}). Please split the roster into smaller files.`
@@ -1262,46 +798,46 @@ async function handleUploadRoster(request, env) {
 
   validateFileMetadata(file);
 
-  /* ---- 3. Virus scan ---- */
-  const scan = await scanFileForViruses(env, file);
-  if (!scan.clean) {
-    throw new HttpError(400, 'File failed the virus scan and was not processed.', {
-      foundViruses: scan.foundViruses,
-    });
-  }
-
-  /* ---- 4. OAuth token for Firestore ---- */
-  const token = await getAccessToken(env, FIRESTORE_SCOPE);
-
-  /* ---- 5. Archival copy on Cloudinary ---- */
+  /* ---- 3. Resolve batchId and cloudinaryUrl ---- */
   let batchId = providedBatchId;
   let cloudinaryUrl = null;
-  let batchDocExists = false;
 
   if (offset > 0 && batchId) {
-    const snap = await getFirestoreDocument(env, token, [
-      'schools', schoolId, 'rosterUploads', batchId,
-    ]);
-    if (snap) {
-      cloudinaryUrl = fromFirestoreDocument(snap).cloudinaryUrl || null;
-      batchDocExists = Boolean(cloudinaryUrl);
-    }
+    const row = await env.DB.prepare(
+      `SELECT cloudinary_url FROM roster_batches WHERE school_id = ? AND id = ?`
+    )
+      .bind(schoolId, batchId)
+      .first();
+    if (row) cloudinaryUrl = row.cloudinary_url || null;
   }
 
   if (offset > 0 && !cloudinaryUrl) {
-    const found = await findRecentBatch(env, token, schoolId, {
-      uid: user.uid,
-      recordType,
-      fileClass,
-      fileStream,
-    });
-    if (found) {
-      batchId = found.id;
-      cloudinaryUrl = found.data.cloudinaryUrl || null;
-      batchDocExists = Boolean(cloudinaryUrl);
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const row = await env.DB.prepare(
+      `SELECT id, cloudinary_url FROM roster_batches
+       WHERE school_id = ? AND uploaded_by = ? AND record_type = ?
+         AND class_name = ? AND stream = ? AND uploaded_at >= ?
+       ORDER BY uploaded_at DESC LIMIT 1`
+    )
+      .bind(schoolId, user.uid, recordType, fileClass, fileStream, cutoff)
+      .first();
+    if (row) {
+      batchId = row.id;
+      cloudinaryUrl = row.cloudinary_url || null;
     }
   }
 
+  /* ---- 4. Virus scan (FIX 3) — at offset 0 or when the file is about to be uploaded ---- */
+  if (offset === 0 || !cloudinaryUrl) {
+    const scan = await scanFileForViruses(env, file);
+    if (!scan.clean) {
+      throw new HttpError(400, 'File failed the virus scan and was not processed.', {
+        foundViruses: scan.foundViruses,
+      });
+    }
+  }
+
+  /* ---- 5. Cloudinary upload if we don't already have one for this batch ---- */
   if (!cloudinaryUrl) {
     const uploaded = await uploadRawToCloudinary(env, file, {
       folder: `edutraceug/roster-uploads/${schoolId}`,
@@ -1317,7 +853,6 @@ async function handleUploadRoster(request, env) {
   /* ---- 7. Process rows ---- */
   const report = await processRosterRows({
     env,
-    token,
     schoolId,
     recordType,
     fileClass,
@@ -1329,70 +864,96 @@ async function handleUploadRoster(request, env) {
     uid: user.uid,
   });
 
-  /* ---- 8. Batch record ---- */
-  const now = new Date();
-  const batchPath = ['schools', schoolId, 'rosterUploads', batchId];
+  /* ---- 8. Batch progress ---- */
+  const now = nowIso();
+  const batchStatus = report.remaining === 0 ? 'complete' : 'in_progress';
 
-  if (offset === 0 && !batchDocExists) {
-    const initial = {
-      cloudinaryUrl,
-      recordType,
-      class: fileClass,
-      stream: fileStream,
-      uploadedBy: user.uid,
-      uploadedAt: now,
-      fileName: file.name || '',
-      fileSize: file.size,
-      sheetName,
-      totalRows: rows.length,
-      headerRowIndex: columns.headerRowIndex,
-      status: report.remaining === 0 ? 'complete' : 'in_progress',
-      createdCount: report.created,
-      updatedCount: report.updated,
-      unchangedCount: report.unchanged,
-      rejectedCount: report.rejected.length,
-      lastProcessedOffset: report.nextOffset,
-    };
-    if (report.remaining === 0) initial.completedAt = now;
-
-    await firestoreCommit(env, token, [
-      {
-        update: {
-          name: docName(env, batchPath),
-          fields: toFirestoreFields(initial),
-        },
-        currentDocument: { exists: false },
-      },
-    ]);
+  if (offset === 0) {
+    await env.DB.prepare(
+      `INSERT INTO roster_batches
+         (school_id, id, record_type, class_name, stream, uploaded_by, uploaded_at,
+          file_name, file_size, sheet_name, total_rows, header_row_index, status,
+          created_count, updated_count, unchanged_count, rejected_count,
+          last_processed_offset, cloudinary_url, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(school_id, id) DO UPDATE SET
+         record_type = excluded.record_type,
+         class_name = excluded.class_name,
+         stream = excluded.stream,
+         uploaded_by = excluded.uploaded_by,
+         uploaded_at = excluded.uploaded_at,
+         file_name = excluded.file_name,
+         file_size = excluded.file_size,
+         sheet_name = excluded.sheet_name,
+         total_rows = excluded.total_rows,
+         header_row_index = excluded.header_row_index,
+         status = excluded.status,
+         created_count = excluded.created_count,
+         updated_count = excluded.updated_count,
+         unchanged_count = excluded.unchanged_count,
+         rejected_count = excluded.rejected_count,
+         last_processed_offset = excluded.last_processed_offset,
+         cloudinary_url = excluded.cloudinary_url,
+         completed_at = excluded.completed_at`
+    )
+      .bind(
+        schoolId,
+        batchId,
+        recordType,
+        fileClass,
+        fileStream,
+        user.uid,
+        now,
+        file.name || '',
+        file.size,
+        sheetName,
+        rows.length,
+        columns.headerRowIndex,
+        batchStatus,
+        report.created,
+        report.updated,
+        report.unchanged,
+        report.rejected.length,
+        report.nextOffset,
+        cloudinaryUrl,
+        report.remaining === 0 ? now : null
+      )
+      .run();
   } else {
-    const snap = await getFirestoreDocument(env, token, batchPath);
-    const existing = snap ? fromFirestoreDocument(snap) : {};
-
-    const rollup = {
-      cloudinaryUrl,
-      createdCount: (Number(existing.createdCount) || 0) + report.created,
-      updatedCount: (Number(existing.updatedCount) || 0) + report.updated,
-      unchangedCount: (Number(existing.unchangedCount) || 0) + report.unchanged,
-      rejectedCount: (Number(existing.rejectedCount) || 0) + report.rejected.length,
-      lastProcessedOffset: report.nextOffset,
-    };
-    if (report.remaining === 0) {
-      rollup.status = 'complete';
-      rollup.completedAt = now;
-    }
-
-    await firestoreCommit(env, token, [
-      {
-        update: {
-          name: docName(env, batchPath),
-          fields: toFirestoreFields(rollup),
-        },
-        updateMask: { fieldPaths: Object.keys(rollup) },
-      },
-    ]);
+    await env.DB.prepare(
+      `UPDATE roster_batches
+       SET cloudinary_url = ?,
+           created_count = created_count + ?,
+           updated_count = updated_count + ?,
+           unchanged_count = unchanged_count + ?,
+           rejected_count = rejected_count + ?,
+           last_processed_offset = ?,
+           status = ?,
+           completed_at = CASE WHEN ? = 'complete' THEN ? ELSE completed_at END
+       WHERE school_id = ? AND id = ?`
+    )
+      .bind(
+        cloudinaryUrl,
+        report.created,
+        report.updated,
+        report.unchanged,
+        report.rejected.length,
+        report.nextOffset,
+        batchStatus,
+        batchStatus,
+        now,
+        schoolId,
+        batchId
+      )
+      .run();
   }
 
-  /* ---- 9. Response ---- */
+  /* ---- 9. Refresh class aggregates — only after the last chunk (whole school) ---- */
+  if (report.remaining === 0) {
+    await refreshClasses(env, schoolId);
+  }
+
+  /* ---- 10. Response ---- */
   return jsonResponse({
     status: 'ok',
     processed: report.processed,
@@ -1406,26 +967,322 @@ async function handleUploadRoster(request, env) {
   });
 }
 
+async function processRosterRows({
+  env,
+  schoolId,
+  recordType,
+  fileClass = '',
+  fileStream = '',
+  rows,
+  offset,
+  batchId,
+  cloudinaryUrl,
+  uid,
+}) {
+  if (!RECORD_TYPES.has(recordType)) {
+    throw new Error(`Invalid recordType: ${recordType}`);
+  }
+
+  const db = env.DB;
+  const slice = rows.slice(offset, offset + MAX_ROWS_PER_CALL);
+  const nextOffset = offset + slice.length;
+  const remaining = Math.max(0, rows.length - nextOffset);
+
+  let created = 0;
+  let updated = 0;
+  let unchanged = 0;
+  const rejected = [];
+  const now = nowIso();
+
+  /* ---- validate + group ---- */
+  const groups = new Map();
+  for (const row of slice) {
+    const { errors, value } = validateAndNormalize(row, fileClass, fileStream, recordType);
+
+    if (errors.length > 0) {
+      rejected.push({ row: row.excelRow, reason: errors.join('; ') });
+      continue;
+    }
+
+    const desired = {
+      recordType,
+      firstName: value.firstName,
+      lastName: value.lastName,
+      class: value.class,
+      gender: value.gender,
+      stream: value.stream,
+      extraDetail: value.extraDetail,
+      studentId: value.studentId,
+      subjects: value.subjects,
+    };
+
+    const key = desiredKey(recordType, desired);
+    const g = groups.get(key);
+
+    if (!g) {
+      groups.set(key, desired);
+    } else {
+      g.subjects = mergeList(g.subjects, desired.subjects);
+      if (!g.gender && desired.gender) g.gender = desired.gender;
+      if (!g.studentId && desired.studentId) g.studentId = desired.studentId;
+      if (!g.extraDetail && desired.extraDetail) g.extraDetail = desired.extraDetail;
+    }
+  }
+
+  const desiredList = [...groups.values()];
+
+  /* ---- Query 1: fetch existing rows for this chunk's name_keys ---- */
+  const nameKeys = [...new Set(desiredList.map((d) => nameKey(d.firstName, d.lastName)))];
+
+  let existingRows = [];
+  if (nameKeys.length > 0) {
+    const result = await db
+      .prepare(
+        `SELECT id, first_name, last_name, class_name, stream, gender, student_id,
+                extra_detail, subjects_json, classes_json
+         FROM roster
+         WHERE school_id = ? AND record_type = ?
+           AND name_key IN (SELECT value FROM json_each(?))`
+      )
+      .bind(schoolId, recordType, JSON.stringify(nameKeys))
+      .all();
+    existingRows = result.results || [];
+  }
+
+  /* ---- Build in-memory index ---- */
+  const exactIndex = new Map();
+  const looseIndex = new Map();
+
+  for (const r of existingRows) {
+    let subjects = [];
+    let classes = [];
+    try { subjects = JSON.parse(r.subjects_json || '[]'); } catch { subjects = []; }
+    try { classes = JSON.parse(r.classes_json || '[]'); } catch { classes = []; }
+
+    const entry = {
+      id: r.id,
+      firstName: r.first_name,
+      lastName: r.last_name,
+      class: r.class_name,
+      stream: r.stream,
+      gender: r.gender,
+      studentId: r.student_id,
+      extraDetail: r.extra_detail,
+      subjects,
+      classes,
+    };
+
+    const exactK = recordType === 'teacher'
+      ? [normKey(r.first_name), normKey(r.last_name)].join('|')
+      : exactStudentKey(entry);
+    if (!exactIndex.has(exactK)) exactIndex.set(exactK, []);
+    exactIndex.get(exactK).push(entry);
+
+    if (recordType === 'student') {
+      const looseK = looseStudentKey(entry);
+      if (!looseIndex.has(looseK)) looseIndex.set(looseK, []);
+      looseIndex.get(looseK).push(entry);
+    }
+  }
+
+  /* ---- Prepare bulk write payload ---- */
+  const updateEntries = [];
+  const insertEntries = [];
+
+  for (const desired of desiredList) {
+    const exactK = desiredKey(recordType, desired);
+    let candidates = exactIndex.get(exactK) || [];
+    if (candidates.length === 0 && recordType === 'student' && !desired.stream) {
+      candidates = looseIndex.get(looseStudentKey(desired)) || [];
+    }
+
+    if (candidates.length > 0) {
+      let chosen = candidates.find((c) =>
+        String(c.firstName ?? '') === desired.firstName &&
+        String(c.lastName ?? '') === desired.lastName &&
+        String(c.class ?? '') === desired.class &&
+        String(c.stream ?? '') === desired.stream &&
+        String(c.gender ?? '') === desired.gender &&
+        String(c.studentId ?? '') === desired.studentId &&
+        String(c.extraDetail ?? '') === desired.extraDetail &&
+        JSON.stringify(c.subjects || []) === JSON.stringify(desired.subjects || [])
+      );
+      if (!chosen && !desired.stream) {
+        chosen = candidates.find((c) => !c.stream);
+      }
+      if (!chosen) chosen = candidates[0];
+
+      const mergedSubjects = mergeList(chosen.subjects, desired.subjects);
+      const mergedClasses = recordType === 'teacher'
+        ? mergeList(chosen.classes, [desired.class])
+        : chosen.classes;
+      const mergedGender = chosen.gender || desired.gender;
+      const mergedStudentId = chosen.studentId || desired.studentId;
+      const mergedExtra = chosen.extraDetail || desired.extraDetail;
+
+      const unchangedRow =
+        String(chosen.firstName) === desired.firstName &&
+        String(chosen.lastName) === desired.lastName &&
+        String(chosen.class) === desired.class &&
+        String(chosen.stream) === desired.stream &&
+        String(chosen.gender || '') === mergedGender &&
+        String(chosen.studentId || '') === mergedStudentId &&
+        String(chosen.extraDetail || '') === mergedExtra &&
+        JSON.stringify(chosen.subjects || []) === JSON.stringify(mergedSubjects) &&
+        (recordType !== 'teacher' ||
+          JSON.stringify(chosen.classes || []) === JSON.stringify(mergedClasses));
+
+      if (unchangedRow) {
+        unchanged += 1;
+        continue;
+      }
+
+      updateEntries.push({
+        id: chosen.id,
+        first_name: desired.firstName,
+        last_name: desired.lastName,
+        name_key: nameKey(desired.firstName, desired.lastName),
+        class_name: desired.class,
+        stream: desired.stream,
+        gender: mergedGender,
+        student_id: mergedStudentId,
+        extra_detail: mergedExtra,
+        subjects_json: JSON.stringify(mergedSubjects),
+        classes_json: JSON.stringify(mergedClasses),
+        batch_id: batchId,
+        cloudinary_url: cloudinaryUrl,
+        updated_at: now,
+        updated_by: uid,
+      });
+      updated += 1;
+    } else {
+      const id = generateDocId();
+      insertEntries.push({
+        id,
+        first_name: desired.firstName,
+        last_name: desired.lastName,
+        name_key: nameKey(desired.firstName, desired.lastName),
+        class_name: desired.class,
+        stream: desired.stream,
+        gender: desired.gender,
+        student_id: desired.studentId,
+        extra_detail: desired.extraDetail,
+        subjects_json: JSON.stringify(desired.subjects || []),
+        classes_json: JSON.stringify(recordType === 'teacher' ? [desired.class] : []),
+      });
+      created += 1;
+    }
+  }
+
+  /* ---- Query 2: bulk upsert inserts ---- */
+  if (insertEntries.length > 0) {
+    const payload = JSON.stringify(insertEntries);
+    await db
+      .prepare(
+        `INSERT INTO roster
+           (school_id, id, record_type, first_name, last_name, name_key,
+            class_name, stream, gender, student_id, extra_detail,
+            subjects_json, classes_json, batch_id, cloudinary_url,
+            created_by, created_at, updated_at)
+         SELECT ?, je.value->>'id', ?, je.value->>'first_name', je.value->>'last_name',
+                je.value->>'name_key', je.value->>'class_name', je.value->>'stream',
+                je.value->>'gender', je.value->>'student_id', je.value->>'extra_detail',
+                je.value->>'subjects_json', je.value->>'classes_json', ?, ?,
+                ?, ?, ?
+         FROM json_each(?) je
+         WHERE true
+         ON CONFLICT(school_id, id) DO UPDATE SET
+           first_name = excluded.first_name,
+           last_name = excluded.last_name,
+           name_key = excluded.name_key,
+           class_name = excluded.class_name,
+           stream = excluded.stream,
+           gender = excluded.gender,
+           student_id = excluded.student_id,
+           extra_detail = excluded.extra_detail,
+           subjects_json = excluded.subjects_json,
+           classes_json = excluded.classes_json,
+           batch_id = excluded.batch_id,
+           cloudinary_url = excluded.cloudinary_url,
+           updated_at = excluded.updated_at`
+      )
+      .bind(schoolId, recordType, batchId, cloudinaryUrl, uid, now, now, payload)
+      .run();
+  }
+
+  /* ---- Query 3: bulk update existing rows ---- */
+  if (updateEntries.length > 0) {
+    const payload = JSON.stringify(updateEntries);
+    await db
+      .prepare(
+        `UPDATE roster
+         SET first_name = je.value->>'first_name',
+             last_name = je.value->>'last_name',
+             name_key = je.value->>'name_key',
+             class_name = je.value->>'class_name',
+             stream = je.value->>'stream',
+             gender = je.value->>'gender',
+             student_id = je.value->>'student_id',
+             extra_detail = je.value->>'extra_detail',
+             subjects_json = je.value->>'subjects_json',
+             classes_json = je.value->>'classes_json',
+             batch_id = je.value->>'batch_id',
+             cloudinary_url = je.value->>'cloudinary_url',
+             updated_at = je.value->>'updated_at',
+             updated_by = je.value->>'updated_by'
+         FROM json_each(?) je
+         WHERE roster.school_id = ?
+           AND roster.id = je.value->>'id'`
+      )
+      .bind(payload, schoolId)
+      .run();
+  }
+
+  return {
+    processed: slice.length,
+    remaining,
+    nextOffset,
+    created,
+    updated,
+    unchanged,
+    rejected,
+  };
+}
+
+// ==================================================================
+// File-extension/MIME gate
+// ==================================================================
+
+function validateFileMetadata(file) {
+  const original = file.name || '';
+  const dot = original.lastIndexOf('.');
+  const ext = dot >= 0 ? original.slice(dot).toLowerCase() : '';
+
+  if (ext === '.xlsb') {
+    throw new UploadValidationError(
+      '".xlsb" files are not supported. Please re-save as .xlsx, .xls, .xlsm, .xltx, .xltm or .csv.'
+    );
+  }
+
+  if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+    throw new UploadValidationError(
+      `Unsupported file type "${ext || '(no extension)'}". Accepted: ${ACCEPTED_EXTENSIONS.join(
+        ', '
+      )}.`
+    );
+  }
+
+  const mime = String(file.type || '').toLowerCase();
+  if (!ACCEPTED_MIME.has(mime)) {
+    throw new UploadValidationError(
+      `Unsupported content type "${file.type}". Please upload an Excel or CSV file.`
+    );
+  }
+}
+
 // ==================================================================
 // Roster viewer/editor endpoints
 // ==================================================================
-
-async function requireUser(request, env, allowedRoles) {
-  const m = (request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
-  if (!m) throw new HttpError(401, 'Missing Authorization header.');
-  const projectId = getServiceAccount(env).project_id;
-  let claims;
-  try {
-    claims = await verifyFirebaseIdToken(m[1].trim(), projectId);
-  } catch (err) {
-    throw new HttpError(401, `Invalid or expired ID token. (${err.message})`);
-  }
-  const user = { uid: claims.sub, role: claims.role || null, schoolId: claims.schoolId || null };
-  if (!allowedRoles.includes(user.role)) {
-    throw new HttpError(403, `Requires role: ${allowedRoles.join(' or ')}.`);
-  }
-  return user;
-}
 
 async function readRosterBody(request, user) {
   const body = await request.json().catch(() => ({}));
@@ -1434,12 +1291,6 @@ async function readRosterBody(request, user) {
     throw new HttpError(403, "Your token's schoolId does not match the requested schoolId.");
   }
   return { body, schoolId };
-}
-
-// Teachers are blocked for now. When the teacher/class assignment data is
-// available, return true here for classes the teacher teaches.
-function canWriteClass(user, _className) {
-  return user.role === 'schoolAdmin';
 }
 
 function cleanStudentFields(input) {
@@ -1452,165 +1303,413 @@ function cleanStudentFields(input) {
     class: s(input.class),
     stream: s(input.stream),
     extraDetail: s(input.extraDetail),
-    subjects: Array.isArray(input.subjects) ? input.subjects.map(s).filter(Boolean) : splitList(input.subjects),
+    subjects: Array.isArray(input.subjects)
+      ? input.subjects.map(s).filter(Boolean)
+      : input.subjects !== undefined
+      ? splitList(input.subjects)
+      : undefined,
   };
-  let gender = s(input.gender);
-  const g = gender.toLowerCase();
-  if (g === 'male' || g === 'm') gender = 'Male';
-  else if (g === 'female' || g === 'f') gender = 'Female';
-  else if (gender) errors.push('gender must be Male or Female');
-  out.gender = gender;
+
+  const rawGender = s(input.gender);
+  if (rawGender) {
+    out.gender = normalizeGender(rawGender);
+    if (!out.gender) errors.push('gender must be Male or Female');
+  } else {
+    out.gender = '';
+  }
 
   if (!out.firstName) errors.push('first name is required');
   if (!out.lastName) errors.push('last name is required');
   if (!out.class) errors.push('class is required');
-  return { errors, value: out };
+  return { errors, value: out, hasSubjects: out.subjects !== undefined };
 }
 
+// ---- /roster/list ----
 async function handleRosterList(request, env) {
-  const user = await requireUser(request, env, ['schoolAdmin', 'teacher']);
-  const { schoolId } = await readRosterBody(request, user);
-  const token = await getAccessToken(env);
+  const user = await requireUser(request, ['schoolAdmin', 'teacher']);
+  const { body, schoolId } = await readRosterBody(request, user);
 
-  const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
-    from: [{ collectionId: 'roster' }],
-    where: fieldFilter('recordType', 'EQUAL', { stringValue: 'student' }),
-  });
+  const cls = strOrEmpty(body.class);
+  const stream = strOrEmpty(body.stream);
+  const qRaw = strOrEmpty(body.q);
+  const q = qRaw.toLowerCase();
+  const rawLimit =
+    body.limit === undefined || body.limit === null ? LIST_DEFAULT_LIMIT : Number(body.limit);
+  const limit = Math.min(
+    Math.max(Number.isFinite(rawLimit) ? rawLimit : LIST_DEFAULT_LIMIT, 1),
+    LIST_MAX_LIMIT
+  );
+  const cursor = strOrEmpty(body.cursor) || null;
 
-  const rows = docs.map((doc) => {
-    const d = fromFirestoreDocument(doc);
+  const where = ['school_id = ?', "record_type = 'student'"];
+  const params = [schoolId];
+
+  if (cls) {
+    where.push('class_name = ?');
+    params.push(cls);
+  }
+  if (stream) {
+    where.push('stream = ?');
+    params.push(stream);
+  }
+
+  // FIX 1: q search — four binds, no template-string interpolation.
+  // (a) first-name side via name_key:  name_key >= q  AND name_key < q + U+FFFF
+  // (b) surname side via lower(last_name): same range, applied to lower(last_name)
+  if (q) {
+    const lower = q;
+    const upper = q + SENTINEL;
+    where.push(
+      `((name_key >= ? AND name_key < ?) OR (lower(last_name) >= ? AND lower(last_name) < ?))`
+    );
+    params.push(lower, upper, lower, upper);
+  }
+
+  // FIX 4: teacher "assigned" scope using EXISTS (json_each).
+  const scope = await getTeacherScope(env, schoolId, user);
+  if (scope) {
+    if (scope.streamOnly.length === 0 && scope.classOnly.length === 0) {
+      return jsonResponse({ status: 'ok', rows: [], nextCursor: null });
+    }
+    const parts = [];
+    if (scope.streamOnly.length > 0) {
+      parts.push(
+        `EXISTS (SELECT 1 FROM json_each(?) j
+                 WHERE j.value->>'class' = roster.class_name
+                   AND j.value->>'stream' = roster.stream)`
+      );
+      params.push(JSON.stringify(scope.streamOnly));
+    }
+    if (scope.classOnly.length > 0) {
+      parts.push(`roster.class_name IN (SELECT value FROM json_each(?))`);
+      params.push(JSON.stringify(scope.classOnly));
+    }
+    where.push(`(${parts.join(' OR ')})`);
+  }
+
+  // Cursor covers (class_name, stream, last_name, first_name, id).
+  if (cursor) {
+    const cparts = cursor.split('\x1f');
+    if (cparts.length === 5) {
+      where.push('(class_name, stream, last_name, first_name, id) > (?, ?, ?, ?, ?)');
+      params.push(cparts[0], cparts[1], cparts[2], cparts[3], cparts[4]);
+    }
+  }
+
+  const sql = `SELECT id, student_id, first_name, last_name, class_name, stream, gender, subjects_json, extra_detail
+               FROM roster
+               WHERE ${where.join(' AND ')}
+               ORDER BY class_name, stream, last_name, first_name, id
+               LIMIT ?`;
+  params.push(limit + 1);
+
+  const res = await env.DB.prepare(sql).bind(...params).all();
+  const all = res.results || [];
+
+  const hasMore = all.length > limit;
+  const page = hasMore ? all.slice(0, limit) : all;
+
+  const rows = page.map((r) => {
+    let subjects = [];
+    try { subjects = JSON.parse(r.subjects_json || '[]'); } catch { subjects = []; }
     return {
-      id: doc.name.split('/').pop(),
-      studentId: d.studentId || '',
-      firstName: d.firstName || '',
-      lastName: d.lastName || '',
-      class: d.class || '',
-      stream: d.stream || '',
-      gender: d.gender || '',
-      subjects: Array.isArray(d.subjects) ? d.subjects : [],
-      extraDetail: d.extraDetail || '',
+      id: r.id,
+      studentId: r.student_id || '',
+      firstName: r.first_name || '',
+      lastName: r.last_name || '',
+      class: r.class_name || '',
+      stream: r.stream || '',
+      gender: r.gender || '',
+      subjects,
+      extraDetail: r.extra_detail || '',
     };
   });
+
+  let nextCursor = null;
+  if (hasMore && page.length > 0) {
+    const last = page[page.length - 1];
+    nextCursor = [
+      last.class_name || '',
+      last.stream || '',
+      last.last_name || '',
+      last.first_name || '',
+      last.id || '',
+    ].join('\x1f');
+  }
+
+  return jsonResponse({ status: 'ok', rows, nextCursor });
+}
+
+// ---- /roster/classes ----
+async function handleRosterClasses(request, env) {
+  const user = await requireUser(request, ['schoolAdmin', 'teacher']);
+  const { schoolId } = await readRosterBody(request, user);
+
+  const where = ['school_id = ?'];
+  const params = [schoolId];
+
+  // FIX 4: apply teacher "assigned" scope here too.
+  const scope = await getTeacherScope(env, schoolId, user);
+  if (scope) {
+    if (scope.streamOnly.length === 0 && scope.classOnly.length === 0) {
+      return jsonResponse({ status: 'ok', rows: [] });
+    }
+    const parts = [];
+    if (scope.streamOnly.length > 0) {
+      parts.push(
+        `EXISTS (SELECT 1 FROM json_each(?) j
+                 WHERE j.value->>'class' = class_structure.class_name
+                   AND j.value->>'stream' = class_structure.stream)`
+      );
+      params.push(JSON.stringify(scope.streamOnly));
+    }
+    if (scope.classOnly.length > 0) {
+      parts.push(`class_structure.class_name IN (SELECT value FROM json_each(?))`);
+      params.push(JSON.stringify(scope.classOnly));
+    }
+    where.push(`(${parts.join(' OR ')})`);
+  }
+
+  const res = await env.DB.prepare(
+    `SELECT class_name, stream, student_count
+     FROM class_structure
+     WHERE ${where.join(' AND ')}
+     ORDER BY class_name, stream`
+  )
+    .bind(...params)
+    .all();
+
+  const rows = (res.results || []).map((r) => ({
+    class: r.class_name,
+    stream: r.stream,
+    student_count: r.student_count,
+  }));
+
   return jsonResponse({ status: 'ok', rows });
 }
 
+// ---- /roster/update ----
 async function handleRosterUpdate(request, env) {
-  const user = await requireUser(request, env, ['schoolAdmin']);
+  const user = await requireUser(request, ['schoolAdmin']);
   const { body, schoolId } = await readRosterBody(request, user);
   const id = strOrEmpty(body.id);
   if (!id) throw new HttpError(400, '"id" is required.');
 
-  const { errors, value } = cleanStudentFields(body.fields || {});
-  if (errors.length) throw new HttpError(400, errors.join('; '));
-  if (!canWriteClass(user, value.class)) throw new HttpError(403, 'You cannot edit this class.');
-
-  const token = await getAccessToken(env);
-  const path = ['schools', schoolId, 'roster', id];
-  const snap = await getFirestoreDocument(env, token, path);
-  if (!snap) throw new HttpError(404, 'Student record not found.');
-  if (fromFirestoreDocument(snap).recordType !== 'student') {
+  const existing = await env.DB.prepare(
+    `SELECT id, record_type, class_name, stream, subjects_json
+     FROM roster WHERE school_id = ? AND id = ?`
+  )
+    .bind(schoolId, id)
+    .first();
+  if (!existing) throw new HttpError(404, 'Student record not found.');
+  if (existing.record_type !== 'student') {
     throw new HttpError(400, 'Only student records can be edited here.');
   }
 
-  const data = { ...value, updatedAt: new Date(), updatedBy: user.uid };
-  await firestoreCommit(env, token, [{
-    update: { name: docName(env, path), fields: toFirestoreFields(data) },
-    updateMask: { fieldPaths: Object.keys(data) },
-    currentDocument: { exists: true },
-  }]);
+  // Accept subjectsText as a fallback.
+  const fields = { ...(body.fields || {}) };
+  if (fields.subjects === undefined && body.subjectsText !== undefined) {
+    fields.subjects = body.subjectsText;
+  }
+  if (fields.subjects === undefined && body.fields && body.fields.subjectsText !== undefined) {
+    fields.subjects = body.fields.subjectsText;
+  }
+
+  const cleaned = cleanStudentFields(fields);
+  if (cleaned.errors.length) throw new HttpError(400, cleaned.errors.join('; '));
+
+  // Preserve existing subjects if none sent.
+  let subjects;
+  if (cleaned.hasSubjects && cleaned.value.subjects !== undefined) {
+    subjects = cleaned.value.subjects;
+  } else {
+    try { subjects = JSON.parse(existing.subjects_json || '[]'); } catch { subjects = []; }
+  }
+
+  const prevClass = existing.class_name || '';
+  const prevStream = existing.stream || '';
+  const prevSubjectsJson = existing.subjects_json || '[]';
+
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE roster
+     SET first_name = ?, last_name = ?, name_key = ?,
+         class_name = ?, stream = ?, gender = ?, student_id = ?,
+         extra_detail = ?, subjects_json = ?, updated_at = ?, updated_by = ?
+     WHERE school_id = ? AND id = ?`
+  )
+    .bind(
+      cleaned.value.firstName,
+      cleaned.value.lastName,
+      nameKey(cleaned.value.firstName, cleaned.value.lastName),
+      cleaned.value.class,
+      cleaned.value.stream,
+      cleaned.value.gender,
+      cleaned.value.studentId,
+      cleaned.value.extraDetail,
+      JSON.stringify(subjects),
+      now,
+      user.uid,
+      schoolId,
+      id
+    )
+    .run();
+
+  // FIX 2: refresh only when class/stream/subjects changed; refresh both
+  // old and new class.
+  const nextSubjectsJson = JSON.stringify(subjects);
+  const classChanged = cleaned.value.class !== prevClass || cleaned.value.stream !== prevStream;
+  const subjectsChanged = nextSubjectsJson !== prevSubjectsJson;
+
+  if (classChanged || subjectsChanged) {
+    const touched = new Set();
+    if (prevClass) touched.add(prevClass);
+    if (cleaned.value.class) touched.add(cleaned.value.class);
+    const classes = [...touched];
+    if (classes.length > 0) {
+      await refreshClasses(env, schoolId, classes);
+    }
+  }
+
   return jsonResponse({ status: 'ok' });
 }
 
+// ---- /roster/add ----
 async function handleRosterAdd(request, env) {
-  const user = await requireUser(request, env, ['schoolAdmin', 'teacher']);
+  const user = await requireUser(request, ['schoolAdmin']);
   const { body, schoolId } = await readRosterBody(request, user);
   const input = Array.isArray(body.rows) ? body.rows : [];
   if (input.length === 0) throw new HttpError(400, '"rows" is required.');
-  if (input.length > 100) throw new HttpError(400, 'Add at most 100 students at a time.');
+  if (input.length > ADD_MAX_ROWS) {
+    throw new HttpError(400, `Add at most ${ADD_MAX_ROWS} students at a time.`);
+  }
 
   const cleaned = [];
   for (let i = 0; i < input.length; i += 1) {
     const { errors, value } = cleanStudentFields(input[i] || {});
     if (errors.length) throw new HttpError(400, `Row ${i + 1}: ${errors.join('; ')}`);
-    if (!canWriteClass(user, value.class)) throw new HttpError(403, `You cannot add students to ${value.class}.`);
+    if (value.subjects === undefined) value.subjects = [];
     cleaned.push(value);
   }
 
-  const token = await getAccessToken(env);
-
-  // One query per distinct class to catch duplicates (same name, class, stream)
+  // Duplicate pre-check using json_each (avoids the 100-bind ceiling).
   const classes = [...new Set(cleaned.map((v) => v.class))];
-  const seen = new Set();
-  for (const cls of classes) {
-    const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
-      from: [{ collectionId: 'roster' }],
-      where: {
-        compositeFilter: {
-          op: 'AND',
-          filters: [
-            fieldFilter('recordType', 'EQUAL', { stringValue: 'student' }),
-            fieldFilter('class', 'EQUAL', { stringValue: cls }),
-          ],
-        },
-      },
-    });
-    for (const doc of docs) {
-      const d = fromFirestoreDocument(doc);
-      seen.add([normKey(d.firstName), normKey(d.lastName), normKey(d.class), normKey(d.stream)].join('|'));
+  const existingSet = new Set();
+  if (classes.length > 0) {
+    const res = await env.DB.prepare(
+      `SELECT first_name, last_name, class_name, stream
+       FROM roster
+       WHERE school_id = ? AND record_type = 'student'
+         AND class_name IN (SELECT value FROM json_each(?))`
+    )
+      .bind(schoolId, JSON.stringify(classes))
+      .all();
+    for (const r of res.results || []) {
+      existingSet.add(
+        [normKey(r.first_name), normKey(r.last_name), normKey(r.class_name), normKey(r.stream)].join('|')
+      );
     }
   }
 
-  const now = new Date();
-  const writes = [];
+  const now = nowIso();
+  const toInsert = [];
   const duplicates = [];
+
   for (const v of cleaned) {
-    const key = [normKey(v.firstName), normKey(v.lastName), normKey(v.class), normKey(v.stream)].join('|');
-    if (seen.has(key)) { duplicates.push(`${v.firstName} ${v.lastName}`); continue; }
-    seen.add(key);
-    const data = {
-      recordType: 'student',
-      ...v,
-      createdBy: user.uid,
-      createdByRole: user.role,
-      createdAt: now,
-      updatedAt: now,
-    };
-    writes.push({
-      update: { name: docName(env, ['schools', schoolId, 'roster', generateDocId()]), fields: toFirestoreFields(data) },
-      currentDocument: { exists: false },
-    });
+    const k = [normKey(v.firstName), normKey(v.lastName), normKey(v.class), normKey(v.stream)].join('|');
+    if (existingSet.has(k)) {
+      duplicates.push(`${v.firstName} ${v.lastName}`);
+      continue;
+    }
+    existingSet.add(k);
+    toInsert.push(v);
   }
-  if (writes.length) await firestoreCommit(env, token, writes);
-  return jsonResponse({ status: 'ok', created: writes.length, duplicates });
+
+  if (toInsert.length > 0) {
+    const payload = JSON.stringify(
+      toInsert.map((v) => ({
+        id: generateDocId(),
+        first_name: v.firstName,
+        last_name: v.lastName,
+        name_key: nameKey(v.firstName, v.lastName),
+        class_name: v.class,
+        stream: v.stream,
+        gender: v.gender,
+        student_id: v.studentId,
+        extra_detail: v.extraDetail,
+        subjects_json: JSON.stringify(v.subjects || []),
+      }))
+    );
+
+    await env.DB.prepare(
+      `INSERT INTO roster
+         (school_id, id, record_type, first_name, last_name, name_key,
+          class_name, stream, gender, student_id, extra_detail,
+          subjects_json, classes_json, created_by, created_at, updated_at)
+       SELECT ?, je.value->>'id', 'student',
+              je.value->>'first_name', je.value->>'last_name', je.value->>'name_key',
+              je.value->>'class_name', je.value->>'stream', je.value->>'gender',
+              je.value->>'student_id', je.value->>'extra_detail',
+              je.value->>'subjects_json', '[]',
+              ?, ?, ?
+       FROM json_each(?) je
+       WHERE true
+       ON CONFLICT(school_id, id) DO NOTHING`
+    )
+      .bind(schoolId, user.uid, now, now, payload)
+      .run();
+  }
+
+  // FIX 2: refresh only classes touched by this add.
+  const touched = [...new Set(cleaned.map((v) => v.class).filter(Boolean))];
+  if (touched.length > 0) {
+    await refreshClasses(env, schoolId, touched);
+  }
+
+  return jsonResponse({ status: 'ok', created: toInsert.length, duplicates });
 }
 
+// ---- /roster/delete ----
 async function handleRosterDelete(request, env) {
-  const user = await requireUser(request, env, ['schoolAdmin']);
+  const user = await requireUser(request, ['schoolAdmin']);
   const { body, schoolId } = await readRosterBody(request, user);
   const id = strOrEmpty(body.id);
   if (!id) throw new HttpError(400, '"id" is required.');
 
-  const token = await getAccessToken(env);
-  const path = ['schools', schoolId, 'roster', id];
-  const snap = await getFirestoreDocument(env, token, path);
-  if (!snap) throw new HttpError(404, 'Student record not found.');
-  if (fromFirestoreDocument(snap).recordType !== 'student') {
+  const existing = await env.DB.prepare(
+    `SELECT id, record_type, class_name FROM roster WHERE school_id = ? AND id = ?`
+  )
+    .bind(schoolId, id)
+    .first();
+  if (!existing) throw new HttpError(404, 'Student record not found.');
+  if (existing.record_type !== 'student') {
     throw new HttpError(400, 'Only student records can be removed here.');
   }
-  await firestoreCommit(env, token, [{ delete: docName(env, path) }]);
+
+  await env.DB.prepare(`DELETE FROM roster WHERE school_id = ? AND id = ?`)
+    .bind(schoolId, id)
+    .run();
+
+  // FIX 2: refresh only the class the student belonged to.
+  if (existing.class_name) {
+    await refreshClasses(env, schoolId, [existing.class_name]);
+  }
+
   return jsonResponse({ status: 'ok' });
 }
 
-const ROSTER_ROUTES = {
+// ==================================================================
+// Router
+// ==================================================================
+
+const POST_ROUTES = {
+  '/upload-roster': handleUploadRoster,
   '/roster/list': handleRosterList,
+  '/roster/classes': handleRosterClasses,
   '/roster/update': handleRosterUpdate,
   '/roster/add': handleRosterAdd,
   '/roster/delete': handleRosterDelete,
 };
-
-// ==================================================================
-// Worker entry point
-// ==================================================================
 
 export default {
   async fetch(request, env, _ctx) {
@@ -1624,17 +1723,9 @@ export default {
       return jsonResponse({ status: 'ok', service: 'edutraceug-roster-worker' });
     }
 
-    if (url.pathname === '/upload-roster' && request.method === 'POST') {
+    if (request.method === 'POST' && POST_ROUTES[url.pathname]) {
       try {
-        return await handleUploadRoster(request, env);
-      } catch (err) {
-        return errorResponse(err);
-      }
-    }
-
-    if (request.method === 'POST' && ROSTER_ROUTES[url.pathname]) {
-      try {
-        return await ROSTER_ROUTES[url.pathname](request, env);
+        return await POST_ROUTES[url.pathname](request, env);
       } catch (err) {
         return errorResponse(err);
       }
