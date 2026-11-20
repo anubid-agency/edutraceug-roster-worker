@@ -573,12 +573,12 @@ const POSITIONAL_ORDER = [
 ];
 
 const ALIASES = {
-  studentId: ['studentid', 'id', 'regno', 'regnumber', 'registration', 'lin', 'no'],
+  studentId: ['studentid', 'id', 'regno', 'regnumber', 'registration', 'lin', 'no', 'admno', 'admissionno', 'admissionnumber', 'admission'],
   firstName: ['firstname', 'givenname', 'forename', 'first', 'fname', 'christianname'],
   lastName: ['lastname', 'surname', 'familyname', 'secondname', 'last', 'lname'],
-  fullName: ['name', 'fullname', 'studentname', 'pupil', 'pupilname'],
-  class: ['class', 'classname', 'grade', 'form', 'level', 'year'],
-  gender: ['gender', 'sex'],
+  fullName: ['name', 'names', 'fullname', 'fullnames', 'studentname', 'studentnames', 'learnername', 'learnernames', 'pupil', 'pupilname', 'pupilnames'],
+  class: ['class', 'classname', 'grade', 'form', 'level', 'year', 'classstream', 'classandstream', 'classsection'],
+  gender: ['gender', 'sex', 'mf', 'malefemale'],
   stream: ['stream', 'section', 'arm', 'division'],
   subject: ['subject', 'subjects', 'subjectcombination', 'combination', 'papers'],
   extraDetail: [
@@ -593,7 +593,6 @@ const ALIASES = {
     'comments',
   ],
 };
-
 function normalizeHeader(value) {
   return String(value ?? '')
     .toLowerCase()
@@ -764,14 +763,21 @@ function normalizeGender(raw) {
   if (g === 'female' || g === 'f') return 'Female';
   return '';
 }
-
+function normalizeClassStream(rawClass, rawStream) {
+  const c = String(rawClass || '').trim();
+  const m = c.match(/^(?:s|sen|senior|form)\.?\s*(\d{1,2})\b[\s\-\/,]*(.*)$/i);
+  if (!m) return { className: c, stream: String(rawStream || '').trim() };
+  const stream = String(rawStream || '').trim() || m[2].trim();
+  return { className: `Senior ${m[1]}`, stream };
+}
 function validateAndNormalize(row, fileClass, fileStream, recordType) {
   const errors = [];
 
   const firstName = row.firstName;
   const lastName = row.lastName;
-  const className = row.class || fileClass || '';
-  const stream = row.stream || fileStream || '';
+ const cs = normalizeClassStream(row.class || fileClass || '', row.stream || fileStream || '');
+const className = cs.className;
+const stream = cs.stream;
   const subjects = splitList(row.subject);
   const extraDetail = row.extraDetail;
   const studentId = row.studentId || '';
